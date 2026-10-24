@@ -1,0 +1,21 @@
+.venv/
+__pycache__/
+*.pyc
+.env
+.env.*
+!.env.example
+*.db
+*.sqlite
+*.sqlite3
+*.log
+.pytest_cache/
+.coverage
+forge.backup.py
+test_forge.backup.py
+
+forge_backup.py
+forge_before_main.py
+
+# Durable per-task run records (run_record.py). Local execution history,
+# not something to commit.
+/runs/

@@ -642,7 +642,23 @@ def check_file_coverage(evidence):
         "missing_executions": sorted(discovered - executed)
     }
 
-def run_tool_chain(answer, evidence, tool_history, step, max_steps, run_record=None):
+def run_tool_chain(answer, evidence, tool_history, step, max_steps, run_record=None,
+                    tool_cache=None):
+    """
+    tool_cache: {call_signature: {"status": "success"|"error", "result"|"error": ...}}
+    An exact repeat of a prior call in this task (same tool, same
+    arguments) is no longer re-executed. Redundant calls used to only be
+    logged while still running again — wasting a real execution (and, for
+    run_command, real side effects) on work Forge already has the answer
+    to. Now the cached result is served back to the model instead, marked
+    as cached rather than silently presented as a fresh execution, and it
+    is NOT added to `evidence` again — so the stall detector in run_task
+    still sees "no new evidence" on a repeat, instead of a cache hit
+    falsely looking like progress.
+    """
+    if tool_cache is None:
+        tool_cache = {}
+
     tool_call = parse_tool_call(answer)
 
     while tool_call and step < max_steps:
@@ -658,11 +674,58 @@ def run_tool_chain(answer, evidence, tool_history, step, max_steps, run_record=N
 
         is_repeated = call_signature in tool_history
 
-        if is_repeated:
+        if is_repeated and call_signature in tool_cache:
             print(
-                f"\n[REDUNDANT TOOL CALL] "
+                f"\n[REDUNDANT TOOL CALL — served from cache, not re-executed] "
                 f"{tool_call.name} {tool_call.arguments}"
             )
+
+            cached = tool_cache[call_signature]
+            tool_history.append(call_signature)
+
+            if run_record is not None:
+                run_record.add_tool_call(ToolCallRecord(
+                    step=step,
+                    tool=tool_call.name,
+                    arguments=tool_call.arguments,
+                    status="cached",
+                    result=cached.get("result"),
+                    error=cached.get("error"),
+                    started_at=time.time(),
+                    duration_seconds=0.0,
+                    redundant=True,
+                ))
+
+            if cached["status"] == "success":
+                tool_message = f"""Tool: {tool_call.name}
+
+Status: cached (identical call already made this task — not re-executed)
+
+Result:
+{cached['result']}
+
+This is the same result you already have. Use it, or request a
+different tool or different arguments. Repeating this exact call will
+keep returning this cached result without doing any new work.
+"""
+            else:
+                tool_message = f"""Tool: {tool_call.name}
+
+Status: cached-error (identical call already failed this task — not re-executed)
+
+Error:
+{cached['error']}
+
+Repeating this exact call will keep failing the same way. Try
+different arguments or a different approach.
+"""
+
+            messages.append({"role": "assistant", "content": answer})
+            messages.append({"role": "user", "content": tool_message})
+
+            answer = ask_model()
+            tool_call = parse_tool_call(answer)
+            continue
 
         tool_history.append(call_signature)
 
@@ -681,6 +744,8 @@ def run_tool_chain(answer, evidence, tool_history, step, max_steps, run_record=N
                 tool_call.arguments,
                 result
             )
+
+            tool_cache[call_signature] = {"status": "success", "result": result}
 
             print(f"\n[Tool: {tool_call.name}]")
             print(result)
@@ -707,6 +772,8 @@ Result:
 
         except Exception as error:
             print(f"\n[Tool Error: {error}]")
+
+            tool_cache[call_signature] = {"status": "error", "error": str(error)}
 
             if run_record is not None:
                 run_record.add_tool_call(ToolCallRecord(
@@ -919,6 +986,7 @@ def run_task(prompt, max_steps=20, max_stalls=3):
         "failed test execution": [],
     }
     tool_history = []
+    tool_cache = {}
     run_record = new_run(task=prompt, model=MODEL_NAME)
     print("\n[Run ID]", run_record.run_id)
     print("\n[Success Definition]")
@@ -935,7 +1003,7 @@ def run_task(prompt, max_steps=20, max_stalls=3):
             answer = ask_model()
             print("\nQwen:", answer)
             answer, tool_call, step = run_tool_chain(
-                answer, evidence, tool_history, step, max_steps, run_record
+                answer, evidence, tool_history, step, max_steps, run_record, tool_cache
             )
         except Exception as error:
             print(f"[Model or tool-loop error] {error}")

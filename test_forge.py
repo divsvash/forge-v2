@@ -350,6 +350,58 @@ class TestFoundationsSlice(unittest.TestCase):
         finally:
             forge.messages[:] = original_messages
 
+    def test_redundant_tool_call_is_not_re_executed(self):
+        """An exact repeat of a prior call (same tool, same arguments) in
+        the same task must be served from cache, not run again — and must
+        not be double-counted as evidence (which would falsely look like
+        progress to the stall detector)."""
+        import contextlib
+        import io
+        import json
+        from unittest.mock import patch
+        from pathlib import Path
+        from tempfile import TemporaryDirectory
+
+        responses = iter([
+            '{"tool":"read_file","arguments":{"filename":"one.py"}}',
+            '{"tool":"read_file","arguments":{"filename":"one.py"}}',
+            "one.py contains a print statement.",
+        ])
+        original_messages = list(forge.messages)
+        try:
+            with TemporaryDirectory() as tmp:
+                workspace = Path(tmp)
+                (workspace / "one.py").write_text("print('hi')\n")
+
+                original_read_file = forge.TOOLS["read_file"].func
+                with patch.object(
+                    forge.TOOLS["read_file"], "func", wraps=original_read_file
+                ) as wrapped_read_file, \
+                        patch.object(forge, "WORKSPACE", workspace), \
+                        patch.object(
+                            forge, "ask_model", side_effect=lambda: next(responses)
+                        ), \
+                        patch("run_record.RUNS_DIR", workspace / "_runs"), \
+                        contextlib.redirect_stdout(io.StringIO()):
+                    result = forge.run_task(
+                        "inspect the contents of one.py", max_steps=10
+                    )
+
+                    # The underlying tool function only actually ran once,
+                    # even though the model asked for it twice.
+                    self.assertEqual(wrapped_read_file.call_count, 1)
+
+                # Evidence wasn't double-counted on the cached repeat.
+                self.assertEqual(
+                    len(result["evidence"]["relevant file contents"]), 1
+                )
+
+                data = json.loads(Path(result["run_record_path"]).read_text())
+                statuses = [call["status"] for call in data["tool_calls"]]
+                self.assertIn("cached", statuses)
+        finally:
+            forge.messages[:] = original_messages
+
 
 if __name__ == "__main__":
     unittest.main()

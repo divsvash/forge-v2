@@ -1,0 +1,230 @@
+From d72155b55c7a64b972e90ee69236d2d00e9e69df Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sun, 25 Oct 2026 21:58:15 +0000
+Subject: [PATCH] Prevent redundant tool calls instead of only logging them
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Closes the last open item from Phase 01's known limitations list:
+"Redundant tool calls are detected, not prevented."
+
+- run_tool_chain() now takes a tool_cache keyed by (tool name, sorted
+  json args). An exact repeat of a prior call in the same task is
+  served the cached result/error instead of being re-executed —
+  important for run_command in particular, where re-running means
+  real side effects, not just wasted time.
+- The cached response is labeled as such to the model ("cached —
+  not re-executed") so Forge doesn't misrepresent a replay as a
+  fresh execution.
+- A cache hit does NOT get re-recorded into `evidence`, so the stall
+  detector in run_task still sees zero new evidence on a repeat
+  instead of a cache hit looking like progress.
+- The run record gets a "cached" tool-call status distinct from
+  "success"/"error" so a run's history honestly shows which calls
+  actually executed.
+
+Added test_redundant_tool_call_is_not_re_executed, which wraps the
+real read_file function to assert it only ran once even though the
+model asked for it twice, and asserts evidence wasn't double-counted.
+
+38/38 tests pass (37 prior + 1 new).
+
+Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01Nf1Av26L3kPBokvvZ1kN29
+---
+ forge.py      | 76 ++++++++++++++++++++++++++++++++++++++++++++++++---
+ test_forge.py | 52 +++++++++++++++++++++++++++++++++++
+ 2 files changed, 124 insertions(+), 4 deletions(-)
+
+diff --git a/forge.py b/forge.py
+index 102f96b..266bb10 100644
+--- a/forge.py
++++ b/forge.py
+@@ -642,7 +642,23 @@ def check_file_coverage(evidence):
+         "missing_executions": sorted(discovered - executed)
+     }
+ 
+-def run_tool_chain(answer, evidence, tool_history, step, max_steps, run_record=None):
++def run_tool_chain(answer, evidence, tool_history, step, max_steps, run_record=None,
++                    tool_cache=None):
++    """
++    tool_cache: {call_signature: {"status": "success"|"error", "result"|"error": ...}}
++    An exact repeat of a prior call in this task (same tool, same
++    arguments) is no longer re-executed. Redundant calls used to only be
++    logged while still running again — wasting a real execution (and, for
++    run_command, real side effects) on work Forge already has the answer
++    to. Now the cached result is served back to the model instead, marked
++    as cached rather than silently presented as a fresh execution, and it
++    is NOT added to `evidence` again — so the stall detector in run_task
++    still sees "no new evidence" on a repeat, instead of a cache hit
++    falsely looking like progress.
++    """
++    if tool_cache is None:
++        tool_cache = {}
++
+     tool_call = parse_tool_call(answer)
+ 
+     while tool_call and step < max_steps:
+@@ -658,12 +674,59 @@ def run_tool_chain(answer, evidence, tool_history, step, max_steps, run_record=N
+ 
+         is_repeated = call_signature in tool_history
+ 
+-        if is_repeated:
++        if is_repeated and call_signature in tool_cache:
+             print(
+-                f"\n[REDUNDANT TOOL CALL] "
++                f"\n[REDUNDANT TOOL CALL — served from cache, not re-executed] "
+                 f"{tool_call.name} {tool_call.arguments}"
+             )
+ 
++            cached = tool_cache[call_signature]
++            tool_history.append(call_signature)
++
++            if run_record is not None:
++                run_record.add_tool_call(ToolCallRecord(
++                    step=step,
++                    tool=tool_call.name,
++                    arguments=tool_call.arguments,
++                    status="cached",
++                    result=cached.get("result"),
++                    error=cached.get("error"),
++                    started_at=time.time(),
++                    duration_seconds=0.0,
++                    redundant=True,
++                ))
++
++            if cached["status"] == "success":
++                tool_message = f"""Tool: {tool_call.name}
++
++Status: cached (identical call already made this task — not re-executed)
++
++Result:
++{cached['result']}
++
++This is the same result you already have. Use it, or request a
++different tool or different arguments. Repeating this exact call will
++keep returning this cached result without doing any new work.
++"""
++            else:
++                tool_message = f"""Tool: {tool_call.name}
++
++Status: cached-error (identical call already failed this task — not re-executed)
++
++Error:
++{cached['error']}
++
++Repeating this exact call will keep failing the same way. Try
++different arguments or a different approach.
++"""
++
++            messages.append({"role": "assistant", "content": answer})
++            messages.append({"role": "user", "content": tool_message})
++
++            answer = ask_model()
++            tool_call = parse_tool_call(answer)
++            continue
++
+         tool_history.append(call_signature)
+ 
+         started_at = time.time()
+@@ -682,6 +745,8 @@ def run_tool_chain(answer, evidence, tool_history, step, max_steps, run_record=N
+                 result
+             )
+ 
++            tool_cache[call_signature] = {"status": "success", "result": result}
++
+             print(f"\n[Tool: {tool_call.name}]")
+             print(result)
+ 
+@@ -708,6 +773,8 @@ Result:
+         except Exception as error:
+             print(f"\n[Tool Error: {error}]")
+ 
++            tool_cache[call_signature] = {"status": "error", "error": str(error)}
++
+             if run_record is not None:
+                 run_record.add_tool_call(ToolCallRecord(
+                     step=step,
+@@ -919,6 +986,7 @@ def run_task(prompt, max_steps=20, max_stalls=3):
+         "failed test execution": [],
+     }
+     tool_history = []
++    tool_cache = {}
+     run_record = new_run(task=prompt, model=MODEL_NAME)
+     print("\n[Run ID]", run_record.run_id)
+     print("\n[Success Definition]")
+@@ -935,7 +1003,7 @@ def run_task(prompt, max_steps=20, max_stalls=3):
+             answer = ask_model()
+             print("\nQwen:", answer)
+             answer, tool_call, step = run_tool_chain(
+-                answer, evidence, tool_history, step, max_steps, run_record
++                answer, evidence, tool_history, step, max_steps, run_record, tool_cache
+             )
+         except Exception as error:
+             print(f"[Model or tool-loop error] {error}")
+diff --git a/test_forge.py b/test_forge.py
+index 084a8e3..da86c03 100644
+--- a/test_forge.py
++++ b/test_forge.py
+@@ -350,6 +350,58 @@ class TestFoundationsSlice(unittest.TestCase):
+         finally:
+             forge.messages[:] = original_messages
+ 
++    def test_redundant_tool_call_is_not_re_executed(self):
++        """An exact repeat of a prior call (same tool, same arguments) in
++        the same task must be served from cache, not run again — and must
++        not be double-counted as evidence (which would falsely look like
++        progress to the stall detector)."""
++        import contextlib
++        import io
++        import json
++        from unittest.mock import patch
++        from pathlib import Path
++        from tempfile import TemporaryDirectory
++
++        responses = iter([
++            '{"tool":"read_file","arguments":{"filename":"one.py"}}',
++            '{"tool":"read_file","arguments":{"filename":"one.py"}}',
++            "one.py contains a print statement.",
++        ])
++        original_messages = list(forge.messages)
++        try:
++            with TemporaryDirectory() as tmp:
++                workspace = Path(tmp)
++                (workspace / "one.py").write_text("print('hi')\n")
++
++                original_read_file = forge.TOOLS["read_file"].func
++                with patch.object(
++                    forge.TOOLS["read_file"], "func", wraps=original_read_file
++                ) as wrapped_read_file, \
++                        patch.object(forge, "WORKSPACE", workspace), \
++                        patch.object(
++                            forge, "ask_model", side_effect=lambda: next(responses)
++                        ), \
++                        patch("run_record.RUNS_DIR", workspace / "_runs"), \
++                        contextlib.redirect_stdout(io.StringIO()):
++                    result = forge.run_task(
++                        "inspect the contents of one.py", max_steps=10
++                    )
++
++                    # The underlying tool function only actually ran once,
++                    # even though the model asked for it twice.
++                    self.assertEqual(wrapped_read_file.call_count, 1)
++
++                # Evidence wasn't double-counted on the cached repeat.
++                self.assertEqual(
++                    len(result["evidence"]["relevant file contents"]), 1
++                )
++
++                data = json.loads(Path(result["run_record_path"]).read_text())
++                statuses = [call["status"] for call in data["tool_calls"]]
++                self.assertIn("cached", statuses)
++        finally:
++            forge.messages[:] = original_messages
++
+ 
+ if __name__ == "__main__":
+     unittest.main()
+-- 
+2.43.0

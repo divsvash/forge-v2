@@ -1,0 +1,1590 @@
+From 01024f1b2053b0dc7d12d302c184a614a78f21da Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 24 Oct 2026 19:30:52 +0000
+Subject: [PATCH] Foundations slice: real sandbox, durable run records, eval
+ harness
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Closes the gaps called out in the audit before any GitHub/X/scheduler
+work starts:
+
+- sandbox.py: run_command no longer trusts shell=True + cwd as
+  isolation. Adds a RestrictedLocalBackend (scrubbed env, POSIX
+  rlimits, output caps, enforced timeout — explicitly NOT isolation)
+  and a DockerBackend (--network none, memory/pids/cpu caps,
+  no-new-privileges, auto-removed container) used only when the
+  Docker daemon is actually reachable. select_backend() probes and
+  falls back honestly; the chosen backend and its real capabilities
+  are recorded with every result, never assumed.
+
+- run_record.py: every run_task() call gets a durable JSON record
+  (run id, task, model, ordered tool calls with args/result/error/
+  timing, completion check, final status) persisted to runs/.
+
+- forge.py:
+  - record_evidence() keeps failed run_command results in
+    "failed command execution" / "failed test execution" buckets
+    instead of silently dropping them.
+  - messages is reset per run_task() call instead of accumulating
+    across tasks in the same process (old gap: task N+1 could see
+    task N's conversation).
+  - TOOLS is now ToolSpec entries (schema, risk tier, sandboxed flag)
+    instead of a bare name->function map.
+  - run_command routed through sandbox.select_backend().
+
+- eval_harness.py: TaskCase/run_suite/compare_baseline_vs_candidate.
+  Runs fixed, reproducible cases (real tools, real completion
+  checking, scripted model responses) in an isolated workspace per
+  case, and compares two run_task implementations with an explicit
+  is_safe_to_promote rule (zero regressions, not just equal-or-better
+  aggregate pass rate).
+
+37/37 tests pass (11 pre-existing + 26 new across test_sandbox.py,
+test_run_record.py, test_eval_harness.py, and additions to
+test_forge.py).
+
+Not in this slice: learning harness proper (turning failures into
+regression cases / candidate strategies), persistent memory,
+GitHub/X/scheduler integrations. Those build on top of this.
+
+Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01Nf1Av26L3kPBokvvZ1kN29
+---
+ .gitignore           |   4 +
+ eval_harness.py      | 265 +++++++++++++++++++++++++++++++++++++
+ forge.py             | 236 +++++++++++++++++++++++++++------
+ run_record.py        |  99 ++++++++++++++
+ sandbox.py           | 305 +++++++++++++++++++++++++++++++++++++++++++
+ test_eval_harness.py |  99 ++++++++++++++
+ test_forge.py        | 126 +++++++++++++++++-
+ test_run_record.py   |  72 ++++++++++
+ test_sandbox.py      |  86 ++++++++++++
+ 9 files changed, 1248 insertions(+), 44 deletions(-)
+ create mode 100644 eval_harness.py
+ create mode 100644 run_record.py
+ create mode 100644 sandbox.py
+ create mode 100644 test_eval_harness.py
+ create mode 100644 test_run_record.py
+ create mode 100644 test_sandbox.py
+
+diff --git a/.gitignore b/.gitignore
+index 58a8439..074edc1 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -15,3 +15,7 @@ test_forge.backup.py
+ 
+ forge_backup.py
+ forge_before_main.py
++
++# Durable per-task run records (run_record.py). Local execution history,
++# not something to commit.
++/runs/
+diff --git a/eval_harness.py b/eval_harness.py
+new file mode 100644
+index 0000000..b9cceca
+--- /dev/null
++++ b/eval_harness.py
+@@ -0,0 +1,265 @@
++"""
++eval_harness.py — repeatable task cases and baseline-vs-candidate evaluation.
++
++This is the "Forge needs a baseline before it can credibly claim a change
++makes it smarter" piece of the foundations slice. It does three things:
++
++  1. Defines TaskCase: a fixed, reproducible scenario — a scratch
++     workspace, a prompt, and an *observable* success check (not "the
++     model said it worked", but a check against the actual workspace
++     and/or the actual run result).
++  2. Runs a case (or a suite of cases) against a given `run_task`
++     implementation, in an isolated temporary workspace, and reports
++     pass/fail, step count and the full run record for each.
++  3. Compares two implementations (baseline vs candidate) across the same
++     suite and reports which cases regressed, improved, or held steady.
++     A candidate is only worth keeping if this comparison says so.
++
++Because this environment has no live Ollama model to call, every case
++drives the model deterministically via `scripted_responses` — a fixed
++sequence of model outputs — rather than mocking "success". This keeps
++the *tool execution* and *completion checking* real while making the
++case reproducible without a live LLM. Swap in a live `ask_model` and
++drop `scripted_responses` to run the same cases against the real model.
++"""
++
++from __future__ import annotations
++
++import shutil
++import tempfile
++from dataclasses import dataclass, field
++from pathlib import Path
++from typing import Callable, Optional
++from unittest.mock import patch
++
++import forge
++import run_record
++
++
++@dataclass
++class TaskCase:
++    case_id: str
++    description: str
++    prompt: str
++    setup: Callable[[Path], None]
++    check: Callable[[dict, Path], tuple[bool, str]]
++    scripted_responses: Optional[list[str]] = None
++    max_steps: int = 10
++
++
++@dataclass
++class CaseResult:
++    case_id: str
++    passed: bool
++    reason: str
++    steps: int
++    run_id: Optional[str]
++    error: Optional[str] = None
++
++
++def run_case(case: TaskCase, run_task_fn=None) -> CaseResult:
++    run_task_fn = run_task_fn or forge.run_task
++
++    with tempfile.TemporaryDirectory() as tmp:
++        workspace = Path(tmp)
++        case.setup(workspace)
++
++        patches = [
++            patch.object(forge, "WORKSPACE", workspace),
++            # Keep each case's run record inside its own scratch dir —
++            # otherwise every eval run would write real run records into
++            # the repo's runs/ directory.
++            patch.object(run_record, "RUNS_DIR", workspace / "_runs"),
++        ]
++        if case.scripted_responses is not None:
++            responses = iter(case.scripted_responses)
++            patches.append(
++                patch.object(forge, "ask_model", side_effect=lambda: next(responses))
++            )
++
++        for p in patches:
++            p.start()
++        try:
++            try:
++                result = run_task_fn(case.prompt, max_steps=case.max_steps)
++            except Exception as error:
++                return CaseResult(
++                    case_id=case.case_id, passed=False,
++                    reason="run_task raised an exception",
++                    steps=0, run_id=None, error=str(error),
++                )
++
++            passed, reason = case.check(result, workspace)
++            return CaseResult(
++                case_id=case.case_id, passed=passed, reason=reason,
++                steps=result.get("steps", 0), run_id=result.get("run_id"),
++            )
++        finally:
++            for p in reversed(patches):
++                p.stop()
++
++
++def run_suite(cases: list[TaskCase], run_task_fn=None) -> list[CaseResult]:
++    return [run_case(case, run_task_fn=run_task_fn) for case in cases]
++
++
++def summarize(results: list[CaseResult]) -> dict:
++    passed = [r for r in results if r.passed]
++    return {
++        "total": len(results),
++        "passed": len(passed),
++        "failed": len(results) - len(passed),
++        "pass_rate": (len(passed) / len(results)) if results else 0.0,
++    }
++
++
++@dataclass
++class ComparisonResult:
++    baseline: list[CaseResult]
++    candidate: list[CaseResult]
++    regressions: list[str]   # case_ids: passed on baseline, failed on candidate
++    improvements: list[str]  # case_ids: failed on baseline, passed on candidate
++    unchanged: list[str]
++
++    @property
++    def is_safe_to_promote(self) -> bool:
++        """A candidate is only promotable if it introduces zero regressions.
++        Improvements with no regressions is the bar; equal-or-better alone
++        (e.g. same pass count via a different failing case) is not enough,
++        because that can hide a real regression behind an unrelated fix."""
++        return len(self.regressions) == 0
++
++
++def compare_baseline_vs_candidate(
++    cases: list[TaskCase], baseline_fn, candidate_fn
++) -> ComparisonResult:
++    baseline_results = run_suite(cases, run_task_fn=baseline_fn)
++    candidate_results = run_suite(cases, run_task_fn=candidate_fn)
++
++    baseline_by_id = {r.case_id: r for r in baseline_results}
++    candidate_by_id = {r.case_id: r for r in candidate_results}
++
++    regressions, improvements, unchanged = [], [], []
++    for case_id in baseline_by_id:
++        before = baseline_by_id[case_id].passed
++        after = candidate_by_id[case_id].passed
++        if before and not after:
++            regressions.append(case_id)
++        elif not before and after:
++            improvements.append(case_id)
++        else:
++            unchanged.append(case_id)
++
++    return ComparisonResult(
++        baseline=baseline_results,
++        candidate=candidate_results,
++        regressions=regressions,
++        improvements=improvements,
++        unchanged=unchanged,
++    )
++
++
++# ---------- DEFAULT BENCHMARK CASES ----------
++# Small, fast, reproducible cases that exercise the real tool pipeline
++# (actual files, actual run_command through the real sandbox backend,
++# actual completion checking) against a scripted model, so the harness
++# itself can be exercised and regression-tested without a live LLM.
++
++def _setup_two_files(workspace: Path) -> None:
++    (workspace / "a.py").write_text("def add(x, y):\n    return x + y\n")
++    (workspace / "b.py").write_text("# unrelated\n")
++
++
++def _check_inspected_a(result: dict, workspace: Path) -> tuple[bool, str]:
++    if not result["completion"]["success"]:
++        return False, f"not verified complete: {result['completion']['missing']}"
++    inspected = {
++        record["arguments"].get("filename")
++        for record in result["evidence"]["relevant file contents"]
++    }
++    if "a.py" not in inspected:
++        return False, f"a.py never inspected via read_file; saw {inspected}"
++    return True, "a.py inspected and task marked complete"
++
++
++CASE_INSPECT_FILE = TaskCase(
++    case_id="inspect_single_file",
++    description="Read a named file and report on it.",
++    prompt="inspect the contents of a.py",
++    setup=_setup_two_files,
++    check=_check_inspected_a,
++    scripted_responses=[
++        '{"tool":"read_file","arguments":{"filename":"a.py"}}',
++        "a.py defines add(x, y), which returns x + y.",
++    ],
++)
++
++
++def _setup_passing_test(workspace: Path) -> None:
++    (workspace / "calc.py").write_text("def add(x, y):\n    return x + y\n")
++    (workspace / "test_calc.py").write_text(
++        "import unittest\n"
++        "from calc import add\n\n"
++        "class TestAdd(unittest.TestCase):\n"
++        "    def test_add(self):\n"
++        "        self.assertEqual(add(1, 2), 3)\n\n"
++        "if __name__ == '__main__':\n"
++        "    unittest.main()\n"
++    )
++
++
++def _check_test_ran(result: dict, workspace: Path) -> tuple[bool, str]:
++    test_evidence = result["evidence"].get("test execution result", [])
++    if not test_evidence:
++        return False, "no successful test execution recorded"
++    return True, "test command executed and recorded as evidence"
++
++
++CASE_RUN_PASSING_TEST = TaskCase(
++    case_id="run_passing_test",
++    description="Run a test file that should pass; evidence must show it ran.",
++    prompt="run the tests in test_calc.py",
++    setup=_setup_passing_test,
++    check=_check_test_ran,
++    scripted_responses=[
++        # unittest rather than pytest so the case has no extra dependency.
++        '{"tool":"run_command","arguments":{"command":"python3 -m unittest test_calc"}}',
++        "The test suite ran and test_add passed.",
++    ],
++    max_steps=5,
++)
++
++
++def _setup_failing_command(workspace: Path) -> None:
++    (workspace / "broken.py").write_text("import sys\nsys.exit(1)\n")
++
++
++def _check_failure_retained(result: dict, workspace: Path) -> tuple[bool, str]:
++    failed = result["evidence"].get("failed command execution", [])
++    if not failed:
++        return False, "failed command was not retained as evidence"
++    return True, "failed command retained as evidence (not silently dropped)"
++
++
++CASE_FAILED_COMMAND_RETAINED = TaskCase(
++    case_id="failed_command_retained_as_evidence",
++    description=(
++        "A failing command must still be recorded as evidence, not dropped "
++        "(this is the gap called out explicitly in the foundations plan)."
++    ),
++    prompt="run broken.py and tell me what happens",
++    setup=_setup_failing_command,
++    check=_check_failure_retained,
++    scripted_responses=[
++        '{"tool":"run_command","arguments":{"command":"python3 broken.py"}}',
++        "broken.py exits with status 1.",
++    ],
++    max_steps=5,
++)
++
++
++DEFAULT_CASES = [
++    CASE_INSPECT_FILE,
++    CASE_RUN_PASSING_TEST,
++    CASE_FAILED_COMMAND_RETAINED,
++]
+diff --git a/forge.py b/forge.py
+index aaaf2d1..102f96b 100644
+--- a/forge.py
++++ b/forge.py
+@@ -3,9 +3,13 @@ import json
+ import requests
+ import subprocess
+ import re
++import time
+ from pathlib import Path
+ from dataclasses import dataclass
+ 
++import sandbox
++from run_record import new_run, ToolCallRecord
++
+ success_definition = None
+ evidence = []
+ 
+@@ -13,6 +17,23 @@ evidence = []
+ 
+ WORKSPACE = Path(__file__).parent.parent / "workspace"
+ 
++# ---------- SANDBOX BACKEND ----------
++# Selected once, lazily, and cached. Never assume Docker is available —
++# ask sandbox.select_backend(), which probes the daemon and falls back to
++# the restricted local backend honestly. See sandbox.py for what each
++# backend actually guarantees.
++
++_backend_cache = None
++
++
++def get_backend():
++    global _backend_cache
++    if _backend_cache is None:
++        _backend_cache = sandbox.select_backend()
++        caps = _backend_cache.capabilities()
++        print(f"[Sandbox] backend={caps.backend} {caps.notes}")
++    return _backend_cache
++
+ 
+ # ---------- TOOL CALL ----------
+ 
+@@ -58,20 +79,9 @@ def write_file(filename, content):
+     return f"Successfully wrote {filename}"
+ 
+ def run_command(command):
+-    result = subprocess.run(
+-        command,
+-        cwd=WORKSPACE,
+-        shell=True,
+-        capture_output=True,
+-        text=True,
+-        timeout=30
+-    )
+-
+-    return {
+-        "exit_code": result.returncode,
+-        "stdout": result.stdout,
+-        "stderr": result.stderr,
+-    }
++    backend = get_backend()
++    result = backend.run(command, WORKSPACE, timeout=30)
++    return result.as_dict()
+ 
+ def search_files(query):
+     matches = []
+@@ -102,13 +112,78 @@ def search_files(query):
+     return matches
+ 
+ # ---------- TOOL REGISTRY ----------
++#
++# Each tool now carries a schema (what arguments it takes), a risk tier,
++# and whether it runs through the sandbox backend. This replaces the bare
++# name -> function mapping: a future permission layer (per-task or
++# per-profile) can read `risk` and `sandboxed` without touching call
++# sites, and the schema gives the model (and a future validator) a
++# concrete contract instead of free-text argument guessing.
++
++@dataclass
++class ToolSpec:
++    name: str
++    func: callable
++    schema: dict
++    risk: str          # "read" | "write" | "execute"
++    sandboxed: bool     # True if this tool is routed through sandbox.py
++
+ 
+ TOOLS = {
+-    "list_files": list_files,
+-    "read_file": read_file,
+-    "write_file": write_file,
+-    "run_command": run_command,
+-    "search_files": search_files,
++    "list_files": ToolSpec(
++        name="list_files",
++        func=list_files,
++        schema={"type": "object", "properties": {}},
++        risk="read",
++        sandboxed=False,
++    ),
++    "read_file": ToolSpec(
++        name="read_file",
++        func=read_file,
++        schema={
++            "type": "object",
++            "properties": {"filename": {"type": "string"}},
++            "required": ["filename"],
++        },
++        risk="read",
++        sandboxed=False,
++    ),
++    "write_file": ToolSpec(
++        name="write_file",
++        func=write_file,
++        schema={
++            "type": "object",
++            "properties": {
++                "filename": {"type": "string"},
++                "content": {"type": "string"},
++            },
++            "required": ["filename", "content"],
++        },
++        risk="write",
++        sandboxed=False,
++    ),
++    "run_command": ToolSpec(
++        name="run_command",
++        func=run_command,
++        schema={
++            "type": "object",
++            "properties": {"command": {"type": "string"}},
++            "required": ["command"],
++        },
++        risk="execute",
++        sandboxed=True,
++    ),
++    "search_files": ToolSpec(
++        name="search_files",
++        func=search_files,
++        schema={
++            "type": "object",
++            "properties": {"query": {"type": "string"}},
++            "required": ["query"],
++        },
++        risk="read",
++        sandboxed=False,
++    ),
+ }
+ 
+ 
+@@ -116,7 +191,7 @@ def execute_tool(name, arguments):
+     if name not in TOOLS:
+         raise ValueError(f"Unknown tool: {name}")
+ 
+-    return TOOLS[name](**arguments)
++    return TOOLS[name].func(**arguments)
+ 
+ 
+ # ---------- TOOL PARSER ----------
+@@ -206,8 +281,9 @@ def validate_tool_call(tool_call):
+ 
+ # ---------- MODEL ----------
+ 
+-messages = [
+-    {
++MODEL_NAME = "qwen2.5-coder:3b"
++
++_SYSTEM_MESSAGE = {
+         "role": "system",
+         "content": """You are Forge, a coding agent.
+ 
+@@ -396,15 +472,16 @@ You must:
+ - then answer the user
+ 
+ Do not answer before completing these steps."""
+-    }
+-]
++}
++
++messages = [_SYSTEM_MESSAGE]
+ 
+ 
+ def ask_model():
+     response = requests.post(
+         "http://localhost:11434/api/chat",
+         json={
+-            "model": "qwen2.5-coder:3b",
++            "model": MODEL_NAME,
+             "messages": messages,
+             "stream": False
+         },
+@@ -457,17 +534,17 @@ def record_evidence(evidence, tool_name, arguments, result):
+     }
+ 
+     if tool_name == "list_files":
+-        evidence["workspace file listing"].append(
++        evidence.setdefault("workspace file listing", []).append(
+             evidence_record
+         )
+ 
+     elif tool_name == "search_files":
+-        evidence["search results"].append(
++        evidence.setdefault("search results", []).append(
+             evidence_record
+         )
+ 
+     elif tool_name == "read_file":
+-        evidence["relevant file contents"].append(
++        evidence.setdefault("relevant file contents", []).append(
+             evidence_record
+         )
+ 
+@@ -475,21 +552,25 @@ def record_evidence(evidence, tool_name, arguments, result):
+         if not isinstance(result, dict):
+             return
+ 
+-        if result.get("exit_code") != 0:
+-            return
+-
+-        evidence["command execution result"].append(
+-            evidence_record
++        command = arguments.get("command", "")
++        succeeded = result.get("exit_code") == 0
++
++        # Failures are evidence too — a failed test run or a failed
++        # command is exactly the data a learning harness needs. They are
++        # kept in their own buckets so existing completion rules (which
++        # only look at the success buckets) are unaffected.
++        command_bucket = (
++            "command execution result" if succeeded
++            else "failed command execution"
+         )
++        evidence.setdefault(command_bucket, []).append(evidence_record)
+ 
+-        stdout = result.get("stdout", "")
+-        stderr = result.get("stderr", "")
+-
+-        command = arguments.get("command", "")
+         if is_test_command(command):
+-            evidence["test execution result"].append(
+-                evidence_record
++            test_bucket = (
++                "test execution result" if succeeded
++                else "failed test execution"
+             )
++            evidence.setdefault(test_bucket, []).append(evidence_record)
+ 
+ def check_success(success_definition, evidence):
+     required = success_definition["required_evidence"]
+@@ -561,7 +642,7 @@ def check_file_coverage(evidence):
+         "missing_executions": sorted(discovered - executed)
+     }
+ 
+-def run_tool_chain(answer, evidence, tool_history, step, max_steps):
++def run_tool_chain(answer, evidence, tool_history, step, max_steps, run_record=None):
+     tool_call = parse_tool_call(answer)
+ 
+     while tool_call and step < max_steps:
+@@ -585,6 +666,7 @@ def run_tool_chain(answer, evidence, tool_history, step, max_steps):
+ 
+         tool_history.append(call_signature)
+ 
++        started_at = time.time()
+         try:
+             validate_tool_call(tool_call)
+ 
+@@ -603,6 +685,18 @@ def run_tool_chain(answer, evidence, tool_history, step, max_steps):
+             print(f"\n[Tool: {tool_call.name}]")
+             print(result)
+ 
++            if run_record is not None:
++                run_record.add_tool_call(ToolCallRecord(
++                    step=step,
++                    tool=tool_call.name,
++                    arguments=tool_call.arguments,
++                    status="success",
++                    result=result,
++                    started_at=started_at,
++                    duration_seconds=time.time() - started_at,
++                    redundant=is_repeated,
++                ))
++
+             tool_message = f"""Tool: {tool_call.name}
+ 
+ Status: success
+@@ -614,6 +708,18 @@ Result:
+         except Exception as error:
+             print(f"\n[Tool Error: {error}]")
+ 
++            if run_record is not None:
++                run_record.add_tool_call(ToolCallRecord(
++                    step=step,
++                    tool=tool_call.name,
++                    arguments=tool_call.arguments,
++                    status="error",
++                    error=str(error),
++                    started_at=started_at,
++                    duration_seconds=time.time() - started_at,
++                    redundant=is_repeated,
++                ))
++
+             tool_message = f"""Tool: {tool_call.name}
+ 
+ Status: error
+@@ -725,6 +831,18 @@ def build_evidence_summary(evidence):
+         lines.append(f"\nTEST COMMAND: {record['arguments'].get('command', 'unknown')}")
+         lines.append(f"Test runner output: {record['result']!r}")
+ 
++    for record in evidence.get("failed command execution", []):
++        command = record["arguments"].get("command", "unknown")
++        result = record["result"]
++        lines.append(f"\nFAILED COMMAND: {command}")
++        lines.append(f"Exit code: {result.get('exit_code') if isinstance(result, dict) else 'unknown'}")
++        lines.append(f"Stdout: {result.get('stdout', '') if isinstance(result, dict) else ''!r}")
++        lines.append(f"Stderr: {result.get('stderr', '') if isinstance(result, dict) else ''!r}")
++
++    for record in evidence.get("failed test execution", []):
++        lines.append(f"\nFAILED TEST COMMAND: {record['arguments'].get('command', 'unknown')}")
++        lines.append(f"Test runner output: {record['result']!r}")
++
+     lines.append(
+         "\nA successful command exit does not by itself prove "
+         "that tests passed."
+@@ -780,21 +898,36 @@ INSTRUCTIONS:
+ 
+ def run_task(prompt, max_steps=20, max_stalls=3):
+     """Run one user task. Stop on verified completion, tool budget, or stalled progress."""
++    # Each task starts with a clean conversation. The module-level
++    # `messages` list used to accumulate across every call to run_task()
++    # in the same process, so an earlier task's context could leak into a
++    # later, unrelated one. Resetting here (and reassigning the module
++    # global, since ask_model()/run_tool_chain()/generate_grounded_answer()
++    # all read the module-level `messages`) fixes that while keeping
++    # `forge.messages` available for callers/tests that inspect it.
++    global messages
++    messages = [_SYSTEM_MESSAGE]
++
+     success_definition = define_success(prompt)
+     evidence = {
+         "search results": [],
+         "relevant file contents": [],
+         "test execution result": [],
+         "command execution result": [],
+-        "workspace file listing": []
++        "workspace file listing": [],
++        "failed command execution": [],
++        "failed test execution": [],
+     }
+     tool_history = []
++    run_record = new_run(task=prompt, model=MODEL_NAME)
++    print("\n[Run ID]", run_record.run_id)
+     print("\n[Success Definition]")
+     print(success_definition)
+     messages.append({"role": "user", "content": prompt})
+ 
+     step = 0
+     stalls = 0
++    loop_error = None
+     completion = check_success(success_definition, evidence)
+     while step < max_steps:
+         before = sum(map(len, evidence.values()))
+@@ -802,10 +935,11 @@ def run_task(prompt, max_steps=20, max_stalls=3):
+             answer = ask_model()
+             print("\nQwen:", answer)
+             answer, tool_call, step = run_tool_chain(
+-                answer, evidence, tool_history, step, max_steps
++                answer, evidence, tool_history, step, max_steps, run_record
+             )
+         except Exception as error:
+             print(f"[Model or tool-loop error] {error}")
++            loop_error = str(error)
+             break
+ 
+         completion = check_success(success_definition, evidence)
+@@ -865,8 +999,24 @@ def run_task(prompt, max_steps=20, max_stalls=3):
+         )
+     messages.append({"role": "assistant", "content": answer})
+     print("\nForge:", answer)
++
++    run_status = "error" if loop_error else (
++        "complete" if completion["success"] else "incomplete"
++    )
++    run_record.finish(
++        status=run_status,
++        completion=completion,
++        answer=answer,
++        steps=step,
++        stalled=stalls >= max_stalls,
++        error=loop_error,
++    )
++    run_path = run_record.save()
++    print(f"\n[Run Record] {run_path}")
++
+     return {"completion": completion, "evidence": evidence, "answer": answer,
+-            "steps": step, "tool_history": tool_history}
++            "steps": step, "tool_history": tool_history, "run_id": run_record.run_id,
++            "run_record_path": str(run_path)}
+ 
+ 
+ def main():
+diff --git a/run_record.py b/run_record.py
+new file mode 100644
+index 0000000..d1acfaa
+--- /dev/null
++++ b/run_record.py
+@@ -0,0 +1,99 @@
++"""
++run_record.py — a durable, structured record of one Forge task.
++
++The previous runtime only had print() statements and an in-memory
++`evidence` dict that vanished when the process exited. This gives each
++`run_task()` call a unique id and a JSON record on disk containing the
++task input, model/config info, every tool call in order (arguments,
++result, error, timestamps, duration), the completion check, and the
++final status. Failed tool calls are recorded as evidence here, not
++discarded — a failed run is exactly the kind of thing the learning
++harness (next slice) needs to see.
++"""
++
++from __future__ import annotations
++
++import json
++import time
++import uuid
++from dataclasses import dataclass, field, asdict
++from pathlib import Path
++from typing import Any
++
++RUNS_DIR = Path(__file__).parent / "runs"
++
++
++@dataclass
++class ToolCallRecord:
++    step: int
++    tool: str
++    arguments: dict
++    status: str  # "success" | "error"
++    result: Any = None
++    error: str | None = None
++    started_at: float = 0.0
++    duration_seconds: float = 0.0
++    redundant: bool = False
++
++
++@dataclass
++class RunRecord:
++    run_id: str
++    task: str
++    model: str
++    started_at: float
++    ended_at: float | None = None
++    tool_calls: list = field(default_factory=list)
++    completion: dict | None = None
++    final_status: str = "running"  # "running" | "complete" | "incomplete" | "error"
++    final_answer: str | None = None
++    steps_taken: int = 0
++    stalled: bool = False
++    error: str | None = None
++
++    def add_tool_call(self, record: "ToolCallRecord") -> None:
++        self.tool_calls.append(asdict(record))
++
++    def finish(self, *, status: str, completion: dict | None, answer: str | None,
++               steps: int, stalled: bool = False, error: str | None = None) -> None:
++        self.ended_at = time.time()
++        self.final_status = status
++        self.completion = completion
++        self.final_answer = answer
++        self.steps_taken = steps
++        self.stalled = stalled
++        self.error = error
++
++    def to_dict(self) -> dict:
++        data = asdict(self)
++        data["tool_calls"] = self.tool_calls
++        return data
++
++    def save(self, directory: Path | None = None) -> Path:
++        directory = directory or RUNS_DIR
++        directory.mkdir(parents=True, exist_ok=True)
++        path = directory / f"{self.run_id}.json"
++        path.write_text(json.dumps(self.to_dict(), indent=2, default=str), encoding="utf-8")
++        return path
++
++
++def new_run(task: str, model: str) -> RunRecord:
++    return RunRecord(
++        run_id=str(uuid.uuid4()),
++        task=task,
++        model=model,
++        started_at=time.time(),
++    )
++
++
++def load_run(run_id: str, directory: Path | None = None) -> dict:
++    directory = directory or RUNS_DIR
++    path = directory / f"{run_id}.json"
++    return json.loads(path.read_text(encoding="utf-8"))
++
++
++def list_runs(directory: Path | None = None) -> list[str]:
++    directory = directory or RUNS_DIR
++    if not directory.exists():
++        return []
++    return sorted(p.stem for p in directory.glob("*.json"))
+diff --git a/sandbox.py b/sandbox.py
+new file mode 100644
+index 0000000..4489cad
+--- /dev/null
++++ b/sandbox.py
+@@ -0,0 +1,305 @@
++"""
++sandbox.py — execution backends for Forge's run_command tool.
++
++The previous implementation ran model-supplied shell strings with
++``subprocess.run(..., shell=True)`` and only a cwd change. That is not
++isolation: a command can still read, write, or delete anything the host
++process can touch, and can still reach the network. This module makes the
++isolation level explicit and honest instead of implicit and assumed.
++
++Two backends:
++
++  RestrictedLocalBackend
++      Always available. Removes the shell-metacharacter and environment-
++      leak risks (scrubbed env, explicit timeout, output size caps,
++      resource limits on POSIX via RLIMIT) and confines the *working
++      directory* to the workspace. It does NOT stop a command from
++      touching files elsewhere on disk that the OS lets the host process
++      touch, and it does NOT block outbound network access. It must never
++      be reported as "sandboxed" — only as "restricted, unisolated".
++
++  DockerBackend
++      Used only when a Docker daemon is actually reachable. Runs the
++      command inside a short-lived container: workspace bind-mounted
++      read-write, everything else is the container's own filesystem,
++      ``--network none``, memory/pids/cpu limits, no new privileges, auto
++      removed. This is the backend that can honestly be called isolated.
++
++``select_backend()`` probes for Docker and falls back to the restricted
++backend when it isn't reachable, returning the backend together with a
++``Capabilities`` description. Callers must persist which backend actually
++ran a command (the run record does this) rather than assuming the strong
++backend was used.
++"""
++
++from __future__ import annotations
++
++import os
++import shlex
++import shutil
++import subprocess
++import sys
++import uuid
++from dataclasses import dataclass, field
++from pathlib import Path
++
++# POSIX-only resource limits (CPU time, memory, process count). On Windows
++# this module is simply unavailable and the restricted backend runs
++# without those limits — that fact is recorded in Capabilities.notes, not
++# hidden.
++try:
++    import resource as _resource  # type: ignore
++    _HAS_RESOURCE = True
++except ImportError:  # Windows
++    _resource = None
++    _HAS_RESOURCE = False
++
++MAX_OUTPUT_CHARS = 200_000
++
++# Environment variables passed through to the child process. Everything
++# else — including anything that looks like a credential — is stripped so
++# a model-supplied command can't exfiltrate the host's secrets via `env`
++# or similar.
++_ENV_ALLOWLIST = {
++    "PATH", "HOME", "LANG", "LC_ALL", "PYTHONIOENCODING",
++    "SYSTEMROOT", "WINDIR", "TEMP", "TMP", "COMSPEC",
++}
++
++
++@dataclass
++class Capabilities:
++    """What a backend actually guarantees. Never assume; always report."""
++    backend: str
++    filesystem_isolated: bool
++    network_blocked: bool
++    resource_limited: bool
++    notes: str
++
++
++@dataclass
++class ExecutionResult:
++    exit_code: int
++    stdout: str
++    stderr: str
++    timed_out: bool
++    backend: str
++    capabilities: Capabilities
++    command: str = ""
++
++    def as_dict(self) -> dict:
++        return {
++            "exit_code": self.exit_code,
++            "stdout": self.stdout,
++            "stderr": self.stderr,
++            "timed_out": self.timed_out,
++            "backend": self.backend,
++            "capabilities": {
++                "filesystem_isolated": self.capabilities.filesystem_isolated,
++                "network_blocked": self.capabilities.network_blocked,
++                "resource_limited": self.capabilities.resource_limited,
++                "notes": self.capabilities.notes,
++            },
++        }
++
++
++def _truncate(text: str, limit: int | None = None) -> str:
++    # Read MAX_OUTPUT_CHARS at call time (not as a default-arg value bound
++    # at import time) so tests/configuration can override it at runtime.
++    if limit is None:
++        limit = MAX_OUTPUT_CHARS
++    if len(text) <= limit:
++        return text
++    return text[:limit] + f"\n...[truncated, {len(text) - limit} more chars]"
++
++
++def _scrubbed_env() -> dict:
++    env = {key: os.environ[key] for key in _ENV_ALLOWLIST if key in os.environ}
++    # Make sure PATH exists even if nothing matched (shouldn't happen, but
++    # a command with no PATH is a confusing failure mode).
++    env.setdefault("PATH", os.defpath)
++    return env
++
++
++class RestrictedLocalBackend:
++    """Best-effort guardrails, explicitly not isolation."""
++
++    name = "restricted-local"
++
++    def capabilities(self) -> Capabilities:
++        return Capabilities(
++            backend=self.name,
++            filesystem_isolated=False,
++            network_blocked=False,
++            resource_limited=_HAS_RESOURCE,
++            notes=(
++                "No filesystem or network isolation. Scrubbed environment, "
++                "capped output, enforced timeout"
++                + (", POSIX CPU/memory/process-count rlimits." if _HAS_RESOURCE
++                   else " (no rlimits available on this platform).")
++            ),
++        )
++
++    def _preexec(self):
++        if not _HAS_RESOURCE:
++            return None
++
++        def _limit():
++            # 30s CPU time, 512MB address space, max 64 child processes.
++            _resource.setrlimit(_resource.RLIMIT_CPU, (30, 30))
++            try:
++                _resource.setrlimit(
++                    _resource.RLIMIT_AS, (512 * 1024 * 1024, 512 * 1024 * 1024)
++                )
++            except (ValueError, OSError):
++                pass  # Some platforms (e.g. macOS) restrict RLIMIT_AS.
++            try:
++                _resource.setrlimit(_resource.RLIMIT_NPROC, (64, 64))
++            except (ValueError, OSError):
++                pass
++
++        return _limit
++
++    def run(self, command: str, workspace: Path, timeout: int) -> ExecutionResult:
++        caps = self.capabilities()
++        kwargs = dict(
++            cwd=workspace,
++            shell=True,
++            capture_output=True,
++            text=True,
++            timeout=timeout,
++            env=_scrubbed_env(),
++        )
++        if _HAS_RESOURCE:
++            kwargs["preexec_fn"] = self._preexec()
++
++        try:
++            result = subprocess.run(command, **kwargs)
++            return ExecutionResult(
++                exit_code=result.returncode,
++                stdout=_truncate(result.stdout),
++                stderr=_truncate(result.stderr),
++                timed_out=False,
++                backend=self.name,
++                capabilities=caps,
++                command=command,
++            )
++        except subprocess.TimeoutExpired as error:
++            return ExecutionResult(
++                exit_code=-1,
++                stdout=_truncate(error.stdout or ""),
++                stderr=_truncate((error.stderr or "") + "\n[killed: timeout]"),
++                timed_out=True,
++                backend=self.name,
++                capabilities=caps,
++                command=command,
++            )
++
++
++class DockerBackend:
++    """Real isolation: short-lived container, no network, resource caps."""
++
++    name = "docker"
++    default_image = "python:3.11-slim"
++
++    def __init__(self, image: str | None = None):
++        self.image = image or self.default_image
++
++    def capabilities(self) -> Capabilities:
++        return Capabilities(
++            backend=self.name,
++            filesystem_isolated=True,
++            network_blocked=True,
++            resource_limited=True,
++            notes=(
++                f"Container ({self.image}), workspace bind-mounted "
++                "read-write, --network none, memory/pids/cpu capped, "
++                "no-new-privileges, auto-removed."
++            ),
++        )
++
++    def run(self, command: str, workspace: Path, timeout: int) -> ExecutionResult:
++        caps = self.capabilities()
++        container_name = f"forge-{uuid.uuid4().hex[:12]}"
++        docker_cmd = [
++            "docker", "run", "--rm",
++            "--name", container_name,
++            "-v", f"{workspace.resolve()}:/workspace",
++            "-w", "/workspace",
++            "--network", "none",
++            "--memory", "256m",
++            "--pids-limit", "128",
++            "--cpus", "1",
++            "--security-opt", "no-new-privileges",
++            self.image,
++            "sh", "-c", command,
++        ]
++
++        try:
++            result = subprocess.run(
++                docker_cmd,
++                capture_output=True,
++                text=True,
++                timeout=timeout,
++            )
++            return ExecutionResult(
++                exit_code=result.returncode,
++                stdout=_truncate(result.stdout),
++                stderr=_truncate(result.stderr),
++                timed_out=False,
++                backend=self.name,
++                capabilities=caps,
++                command=command,
++            )
++        except subprocess.TimeoutExpired:
++            subprocess.run(
++                ["docker", "kill", container_name],
++                capture_output=True, timeout=10,
++            )
++            return ExecutionResult(
++                exit_code=-1,
++                stdout="",
++                stderr="[killed: timeout]",
++                timed_out=True,
++                backend=self.name,
++                capabilities=caps,
++                command=command,
++            )
++
++
++def _docker_daemon_reachable() -> bool:
++    if shutil.which("docker") is None:
++        return False
++    try:
++        result = subprocess.run(
++            ["docker", "info"],
++            capture_output=True,
++            timeout=5,
++        )
++        return result.returncode == 0
++    except (subprocess.TimeoutExpired, OSError):
++        return False
++
++
++def select_backend(prefer: str = "auto", docker_image: str | None = None):
++    """Pick the strongest backend actually available right now.
++
++    prefer="auto"   -> Docker if the daemon is reachable, else restricted-local.
++    prefer="docker" -> Docker, raising if the daemon isn't reachable.
++    prefer="local"  -> always the restricted local backend.
++    """
++    if prefer == "local":
++        return RestrictedLocalBackend()
++
++    if prefer == "docker":
++        if not _docker_daemon_reachable():
++            raise RuntimeError(
++                "Docker backend requested but the Docker daemon is not "
++                "reachable. Refusing to silently fall back for an explicit "
++                "request — pass prefer='auto' to allow fallback."
++            )
++        return DockerBackend(image=docker_image)
++
++    if _docker_daemon_reachable():
++        return DockerBackend(image=docker_image)
++
++    return RestrictedLocalBackend()
+diff --git a/test_eval_harness.py b/test_eval_harness.py
+new file mode 100644
+index 0000000..8713cd0
+--- /dev/null
++++ b/test_eval_harness.py
+@@ -0,0 +1,99 @@
++import contextlib
++import io
++import unittest
++from pathlib import Path
++
++import eval_harness
++import forge
++from eval_harness import (
++    DEFAULT_CASES, run_case, run_suite, summarize, compare_baseline_vs_candidate,
++)
++
++
++class TestEvalHarness(unittest.TestCase):
++    def setUp(self):
++        self._original_messages = list(forge.messages)
++        self._stdout = contextlib.redirect_stdout(io.StringIO())
++        self._stdout.__enter__()
++
++    def tearDown(self):
++        self._stdout.__exit__(None, None, None)
++        forge.messages[:] = self._original_messages
++
++    def test_default_cases_pass_against_real_forge(self):
++        results = run_suite(DEFAULT_CASES)
++        failures = [(r.case_id, r.reason, r.error) for r in results if not r.passed]
++        self.assertEqual(failures, [], f"unexpected failures: {failures}")
++
++    def test_summarize_reports_pass_rate(self):
++        results = run_suite(DEFAULT_CASES)
++        summary = summarize(results)
++        self.assertEqual(summary["total"], len(DEFAULT_CASES))
++        self.assertEqual(summary["passed"], len(DEFAULT_CASES))
++        self.assertEqual(summary["pass_rate"], 1.0)
++
++    def test_case_run_isolated_in_its_own_workspace(self):
++        seen_workspaces = []
++
++        def setup(workspace: Path):
++            seen_workspaces.append(workspace)
++            (workspace / "x.py").write_text("x = 1\n")
++
++        def check(result, workspace):
++            return True, "ok"
++
++        case = eval_harness.TaskCase(
++            case_id="isolated",
++            description="just checks workspace isolation",
++            prompt="inspect x.py",
++            setup=setup,
++            check=check,
++            scripted_responses=[
++                '{"tool":"read_file","arguments":{"filename":"x.py"}}',
++                "x.py sets x = 1.",
++            ],
++        )
++        result = run_case(case)
++        self.assertTrue(result.passed)
++        # The workspace must not be the real repo workspace.
++        self.assertNotEqual(seen_workspaces[0], forge.WORKSPACE)
++
++    def test_comparison_detects_regression(self):
++        def passing_run_task(prompt, max_steps=10, max_stalls=3):
++            return {
++                "completion": {"success": True, "missing": []},
++                "evidence": {
++                    "relevant file contents": [{"arguments": {"filename": "a.py"}}],
++                    "test execution result": [{"x": 1}],
++                    "failed command execution": [{"x": 1}],
++                },
++                "answer": "ok", "steps": 1, "tool_history": [], "run_id": "r1",
++            }
++
++        def regressing_run_task(prompt, max_steps=10, max_stalls=3):
++            return {
++                "completion": {"success": False, "missing": ["x"]},
++                "evidence": {
++                    "relevant file contents": [],
++                    "test execution result": [],
++                    "failed command execution": [],
++                },
++                "answer": "fail", "steps": 1, "tool_history": [], "run_id": "r2",
++            }
++
++        comparison = compare_baseline_vs_candidate(
++            DEFAULT_CASES, passing_run_task, regressing_run_task
++        )
++        self.assertFalse(comparison.is_safe_to_promote)
++        self.assertEqual(set(comparison.regressions), {c.case_id for c in DEFAULT_CASES})
++
++    def test_comparison_allows_promotion_with_no_regressions(self):
++        comparison = compare_baseline_vs_candidate(
++            DEFAULT_CASES, forge.run_task, forge.run_task
++        )
++        self.assertTrue(comparison.is_safe_to_promote)
++        self.assertEqual(comparison.regressions, [])
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/test_forge.py b/test_forge.py
+index b50d658..084a8e3 100644
+--- a/test_forge.py
++++ b/test_forge.py
+@@ -197,7 +197,8 @@ class TestForgeIntegration(unittest.TestCase):
+             try:
+                 with patch.object(forge, "WORKSPACE", workspace), patch.object(
+                     forge, "ask_model", side_effect=lambda: next(responses)
+-                ), contextlib.redirect_stdout(io.StringIO()):
++                ), patch("run_record.RUNS_DIR", workspace / "_runs"), \
++                        contextlib.redirect_stdout(io.StringIO()):
+                     result = forge.run_task(
+                         "find where hello is used, inspect the relevant files", max_steps=20
+                     )
+@@ -227,5 +228,128 @@ class TestForgeIntegration(unittest.TestCase):
+         result = forge.check_success(forge.define_success("build an application"), evidence)
+         self.assertFalse(result["success"])
+ 
++
++class TestFoundationsSlice(unittest.TestCase):
++    """Covers the foundations slice: failure-as-evidence, no message leak
++    across tasks, and a durable run record for every run_task() call."""
++
++    def test_failed_command_is_recorded_not_dropped(self):
++        evidence = {}
++        forge.record_evidence(
++            evidence, "run_command", {"command": "python broken.py"},
++            {"exit_code": 1, "stdout": "", "stderr": "Traceback..."},
++        )
++        self.assertEqual(len(evidence["failed command execution"]), 1)
++        self.assertNotIn("command execution result", evidence)
++
++    def test_failed_test_command_lands_in_failed_test_bucket(self):
++        evidence = {}
++        forge.record_evidence(
++            evidence, "run_command", {"command": "pytest"},
++            {"exit_code": 1, "stdout": "1 failed", "stderr": ""},
++        )
++        self.assertEqual(len(evidence["failed test execution"]), 1)
++        self.assertNotIn("test execution result", evidence)
++
++    def test_successful_command_still_goes_to_original_buckets(self):
++        evidence = {}
++        forge.record_evidence(
++            evidence, "run_command", {"command": "pytest"},
++            {"exit_code": 0, "stdout": "ok", "stderr": ""},
++        )
++        self.assertEqual(len(evidence["command execution result"]), 1)
++        self.assertEqual(len(evidence["test execution result"]), 1)
++        self.assertNotIn("failed command execution", evidence)
++
++    def test_messages_do_not_leak_between_tasks(self):
++        import contextlib
++        import io
++        from unittest.mock import patch
++        from pathlib import Path
++        from tempfile import TemporaryDirectory
++
++        original_messages = list(forge.messages)
++        try:
++            with TemporaryDirectory() as tmp:
++                with patch.object(forge, "WORKSPACE", Path(tmp)), patch.object(
++                    forge, "ask_model", return_value="Noted."
++                ), patch("run_record.RUNS_DIR", Path(tmp) / "runs"), \
++                        contextlib.redirect_stdout(io.StringIO()):
++                    forge.run_task(
++                        "remember the secret word banana", max_steps=5, max_stalls=1
++                    )
++                    forge.run_task(
++                        "what did I just ask about?", max_steps=5, max_stalls=1
++                    )
++
++            task_contents = [
++                m["content"] for m in forge.messages if m["role"] == "user"
++            ]
++            self.assertTrue(
++                any("what did I just ask" in c for c in task_contents)
++            )
++            self.assertFalse(
++                any("secret word banana" in c for c in task_contents)
++            )
++        finally:
++            forge.messages[:] = original_messages
++
++    def test_run_task_writes_a_durable_run_record(self):
++        import contextlib
++        import io
++        import json
++        from unittest.mock import patch
++        from pathlib import Path
++        from tempfile import TemporaryDirectory
++
++        original_messages = list(forge.messages)
++        try:
++            with TemporaryDirectory() as tmp:
++                runs_dir = Path(tmp) / "runs"
++                with patch.object(forge, "WORKSPACE", Path(tmp)), patch.object(
++                    forge, "ask_model", return_value="Final answer."
++                ), patch("run_record.RUNS_DIR", runs_dir), \
++                        contextlib.redirect_stdout(io.StringIO()):
++                    result = forge.run_task("a trivial task")
++
++                self.assertIn("run_id", result)
++                record_path = Path(result["run_record_path"])
++                self.assertTrue(record_path.exists())
++
++                data = json.loads(record_path.read_text())
++                self.assertEqual(data["task"], "a trivial task")
++                self.assertEqual(data["run_id"], result["run_id"])
++                self.assertIn(data["final_status"], ("complete", "incomplete"))
++        finally:
++            forge.messages[:] = original_messages
++
++    def test_run_record_keeps_failed_tool_calls(self):
++        import contextlib
++        import io
++        from unittest.mock import patch
++        from pathlib import Path
++        from tempfile import TemporaryDirectory
++
++        responses = iter([
++            '{"tool":"read_file","arguments":{"filename":"missing.py"}}',
++            "I could not find that file.",
++        ])
++        original_messages = list(forge.messages)
++        try:
++            with TemporaryDirectory() as tmp:
++                with patch.object(forge, "WORKSPACE", Path(tmp)), patch.object(
++                    forge, "ask_model", side_effect=lambda: next(responses)
++                ), patch("run_record.RUNS_DIR", Path(tmp) / "runs"), \
++                        contextlib.redirect_stdout(io.StringIO()):
++                    result = forge.run_task("read missing.py", max_steps=5)
++
++                import json
++                data = json.loads(Path(result["run_record_path"]).read_text())
++                statuses = [call["status"] for call in data["tool_calls"]]
++                self.assertIn("error", statuses)
++        finally:
++            forge.messages[:] = original_messages
++
++
+ if __name__ == "__main__":
+     unittest.main()
+diff --git a/test_run_record.py b/test_run_record.py
+new file mode 100644
+index 0000000..7f6e70e
+--- /dev/null
++++ b/test_run_record.py
+@@ -0,0 +1,72 @@
++import json
++import unittest
++from pathlib import Path
++from tempfile import TemporaryDirectory
++
++from run_record import new_run, ToolCallRecord
++
++
++class TestRunRecord(unittest.TestCase):
++    def test_new_run_has_unique_id(self):
++        a = new_run(task="do x", model="m1")
++        b = new_run(task="do x", model="m1")
++        self.assertNotEqual(a.run_id, b.run_id)
++
++    def test_tool_calls_recorded_in_order(self):
++        run = new_run(task="do x", model="m1")
++        run.add_tool_call(ToolCallRecord(
++            step=1, tool="list_files", arguments={}, status="success",
++            result=["a.py"],
++        ))
++        run.add_tool_call(ToolCallRecord(
++            step=2, tool="read_file", arguments={"filename": "a.py"},
++            status="error", error="boom",
++        ))
++        self.assertEqual(len(run.tool_calls), 2)
++        self.assertEqual(run.tool_calls[0]["tool"], "list_files")
++        self.assertEqual(run.tool_calls[1]["status"], "error")
++        self.assertEqual(run.tool_calls[1]["error"], "boom")
++
++    def test_failed_tool_call_is_retained_not_dropped(self):
++        run = new_run(task="do x", model="m1")
++        run.add_tool_call(ToolCallRecord(
++            step=1, tool="run_command", arguments={"command": "false"},
++            status="error", error="exit 1",
++        ))
++        self.assertEqual(len(run.tool_calls), 1)
++
++    def test_save_writes_durable_json(self):
++        run = new_run(task="do x", model="m1")
++        run.add_tool_call(ToolCallRecord(
++            step=1, tool="list_files", arguments={}, status="success",
++            result=["a.py"],
++        ))
++        run.finish(
++            status="complete",
++            completion={"success": True, "missing": []},
++            answer="done",
++            steps=1,
++        )
++        with TemporaryDirectory() as tmp:
++            path = run.save(Path(tmp))
++            self.assertTrue(path.exists())
++            data = json.loads(path.read_text())
++            self.assertEqual(data["run_id"], run.run_id)
++            self.assertEqual(data["final_status"], "complete")
++            self.assertEqual(len(data["tool_calls"]), 1)
++
++    def test_finish_sets_final_status(self):
++        run = new_run(task="do x", model="m1")
++        run.finish(
++            status="incomplete",
++            completion={"success": False, "missing": ["x"]},
++            answer="partial",
++            steps=3,
++        )
++        self.assertEqual(run.final_status, "incomplete")
++        self.assertEqual(run.steps_taken, 3)
++        self.assertIsNotNone(run.ended_at)
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/test_sandbox.py b/test_sandbox.py
+new file mode 100644
+index 0000000..9ac3d9c
+--- /dev/null
++++ b/test_sandbox.py
+@@ -0,0 +1,86 @@
++import platform
++import unittest
++from pathlib import Path
++from tempfile import TemporaryDirectory
++from unittest.mock import patch
++
++import sandbox
++
++
++class TestRestrictedLocalBackend(unittest.TestCase):
++    def test_runs_command_in_workspace(self):
++        backend = sandbox.RestrictedLocalBackend()
++        with TemporaryDirectory() as tmp:
++            workspace = Path(tmp)
++            (workspace / "marker.txt").write_text("hello")
++            result = backend.run("ls", workspace, timeout=10)
++            self.assertEqual(result.exit_code, 0)
++            self.assertIn("marker.txt", result.stdout)
++            self.assertFalse(result.timed_out)
++
++    def test_capabilities_are_honest_about_no_isolation(self):
++        backend = sandbox.RestrictedLocalBackend()
++        caps = backend.capabilities()
++        self.assertFalse(caps.filesystem_isolated)
++        self.assertFalse(caps.network_blocked)
++
++    def test_nonzero_exit_code_is_reported_not_swallowed(self):
++        backend = sandbox.RestrictedLocalBackend()
++        with TemporaryDirectory() as tmp:
++            result = backend.run("exit 7", Path(tmp), timeout=10)
++            self.assertEqual(result.exit_code, 7)
++
++    def test_timeout_is_reported(self):
++        backend = sandbox.RestrictedLocalBackend()
++        with TemporaryDirectory() as tmp:
++            result = backend.run("sleep 5", Path(tmp), timeout=1)
++            self.assertTrue(result.timed_out)
++            self.assertEqual(result.exit_code, -1)
++
++    def test_environment_is_scrubbed(self):
++        backend = sandbox.RestrictedLocalBackend()
++        with TemporaryDirectory() as tmp:
++            with patch.dict("os.environ", {"FORGE_TEST_SECRET": "leak-me"}):
++                result = backend.run(
++                    "echo $FORGE_TEST_SECRET", Path(tmp), timeout=10
++                )
++            self.assertNotIn("leak-me", result.stdout)
++
++    def test_output_is_truncated(self):
++        backend = sandbox.RestrictedLocalBackend()
++        with TemporaryDirectory() as tmp:
++            # Ask for far more output than the cap and confirm it's capped.
++            original_limit = sandbox.MAX_OUTPUT_CHARS
++            with patch.object(sandbox, "MAX_OUTPUT_CHARS", 100):
++                result = backend.run(
++                    "python3 -c \"print('x' * 1000)\"", Path(tmp), timeout=10
++                )
++            self.assertLess(len(result.stdout), 1000)
++            self.assertIn("truncated", result.stdout)
++
++
++class TestSelectBackend(unittest.TestCase):
++    def test_falls_back_to_local_when_docker_unreachable(self):
++        with patch.object(sandbox, "_docker_daemon_reachable", return_value=False):
++            backend = sandbox.select_backend()
++            self.assertIsInstance(backend, sandbox.RestrictedLocalBackend)
++
++    def test_uses_docker_when_reachable(self):
++        with patch.object(sandbox, "_docker_daemon_reachable", return_value=True):
++            backend = sandbox.select_backend()
++            self.assertIsInstance(backend, sandbox.DockerBackend)
++
++    def test_explicit_local_never_probes_docker(self):
++        with patch.object(sandbox, "_docker_daemon_reachable") as probe:
++            backend = sandbox.select_backend(prefer="local")
++            self.assertIsInstance(backend, sandbox.RestrictedLocalBackend)
++            probe.assert_not_called()
++
++    def test_explicit_docker_raises_when_unavailable(self):
++        with patch.object(sandbox, "_docker_daemon_reachable", return_value=False):
++            with self.assertRaises(RuntimeError):
++                sandbox.select_backend(prefer="docker")
++
++
++if __name__ == "__main__":
++    unittest.main()
+-- 
+2.43.0

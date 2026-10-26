@@ -1,0 +1,523 @@
+From 4acc4e4ea533b4dc3b33b56530fe4dc27cc3cade Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sun, 25 Oct 2026 22:01:34 +0000
+Subject: [PATCH] Add transactional code editing: edit -> test -> keep/rollback
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Closes the last open item from Phase 01's known limitations list:
+"transactional code editing (edit -> test -> keep/rollback)".
+
+Previously a code change was write_file + a separate run_command the
+model had to remember to issue, with nothing undoing a bad edit if
+the follow-up check failed. transactions.py makes edit+verify+rollback
+one atomic runtime operation instead of a multi-step pattern the model
+has to get right on its own:
+
+- transactions.apply_change_with_test(workspace, filename, content,
+  test_command, backend): snapshots the file's current content (or
+  notes it didn't exist), writes the new content, runs test_command
+  through the real sandbox backend, and on a nonzero exit restores the
+  file to exactly its prior content (or deletes it, if this call
+  created it).
+
+- forge.py: new apply_change_with_test tool, registered in TOOLS with
+  risk="write", sandboxed=True. record_evidence() files its outcome
+  into a new "transactional edits" bucket and, when the test command
+  is a real test runner, into the existing test execution / failed
+  test execution buckets — keyed on whether the change was actually
+  kept, not just attempted.
+
+- build_evidence_summary() reports kept vs rolled-back edits
+  explicitly, and the grounding instructions now tell the model never
+  to describe a rolled-back edit as if it survived.
+
+- System prompt documents the new tool and a JSON example, with an
+  explicit instruction not to follow it with a redundant verification
+  call (the tool loop will cache that into the model's own history,
+  but telling it up front avoids wasting a step).
+
+test_transactions.py (6 tests): keeps on pass, rolls back an existing
+file on fail, deletes a newly-created file on fail, rejects workspace
+escape, reports real exit code/output, and a real failing unittest
+run actually triggers the rollback end-to-end (no mocked command).
+
+test_forge.py: two new end-to-end tests driving the full run_task()
+loop — one where the model's edit passes and is kept, one where it
+breaks the real test suite and is proven to be rolled back to the
+exact original file content, with the grounded summary required to
+say "ROLLED BACK" rather than imply the change stuck.
+
+46/46 tests pass (38 prior + 8 new). This closes out Phase 01
+("Reliable core") entirely — every item in the known-limitations list
+from the vision doc is now addressed.
+
+Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01Nf1Av26L3kPBokvvZ1kN29
+---
+ forge.py             | 97 ++++++++++++++++++++++++++++++++++++++++++++
+ test_forge.py        | 93 ++++++++++++++++++++++++++++++++++++++++++
+ test_transactions.py | 97 ++++++++++++++++++++++++++++++++++++++++++++
+ transactions.py      | 78 +++++++++++++++++++++++++++++++++++
+ 4 files changed, 365 insertions(+)
+ create mode 100644 test_transactions.py
+ create mode 100644 transactions.py
+
+diff --git a/forge.py b/forge.py
+index 266bb10..929feea 100644
+--- a/forge.py
++++ b/forge.py
+@@ -8,6 +8,7 @@ from pathlib import Path
+ from dataclasses import dataclass
+ 
+ import sandbox
++import transactions
+ from run_record import new_run, ToolCallRecord
+ 
+ success_definition = None
+@@ -83,6 +84,17 @@ def run_command(command):
+     result = backend.run(command, WORKSPACE, timeout=30)
+     return result.as_dict()
+ 
++def apply_change_with_test(filename, content, test_command):
++    """Write `content` to `filename`, run `test_command`, and keep the
++    change only if it exits 0 — otherwise restore the file to exactly
++    what it was before (or delete it, if this call created it). See
++    transactions.py for why this is one atomic tool rather than a
++    write_file + run_command sequence the model has to get right."""
++    backend = get_backend()
++    return transactions.apply_change_with_test(
++        WORKSPACE, filename, content, test_command, backend, timeout=30
++    )
++
+ def search_files(query):
+     matches = []
+ 
+@@ -184,6 +196,21 @@ TOOLS = {
+         risk="read",
+         sandboxed=False,
+     ),
++    "apply_change_with_test": ToolSpec(
++        name="apply_change_with_test",
++        func=apply_change_with_test,
++        schema={
++            "type": "object",
++            "properties": {
++                "filename": {"type": "string"},
++                "content": {"type": "string"},
++                "test_command": {"type": "string"},
++            },
++            "required": ["filename", "content", "test_command"],
++        },
++        risk="write",
++        sandboxed=True,
++    ),
+ }
+ 
+ 
+@@ -324,6 +351,20 @@ Searches the contents of files inside the Forge workspace for a text query.
+ Argument:
+ - query: text to search for
+ 
++apply_change_with_test:
++Writes a file and immediately verifies it with a test command, as a
++single atomic operation. If the test command exits 0, the change is
++kept. If it does not, Forge automatically restores the file to exactly
++what it contained before this call (or deletes it, if the file did not
++exist before). Use this instead of write_file whenever a change should
++be verified before it is kept — do not follow it with a second,
++separate run_command to "double check": the verification already
++happened, and the result tells you whether the change survived.
++Arguments:
++- filename: path relative to the workspace
++- content: complete new contents to write
++- test_command: command to run to verify the change (e.g. a test runner)
++
+ TOOL PROTOCOL:
+ 
+ You may REQUEST tools. You do not execute tools yourself.
+@@ -417,6 +458,17 @@ Another example:
+   }
+ }
+ 
++Another example:
++
++{
++  "tool": "apply_change_with_test",
++  "arguments": {
++    "filename": "factorial.py",
++    "content": "def factorial(n):\n    return 1 if n <= 1 else n * factorial(n - 1)\n",
++    "test_command": "python -m unittest test_factorial"
++  }
++}
++
+ Do not invent files.
+ Do not access files outside the workspace.
+ 
+@@ -572,6 +624,27 @@ def record_evidence(evidence, tool_name, arguments, result):
+             )
+             evidence.setdefault(test_bucket, []).append(evidence_record)
+ 
++    elif tool_name == "apply_change_with_test":
++        if not isinstance(result, dict):
++            return
++
++        # A transactional edit is itself a write (something changed in
++        # the workspace) and, when its command is a real test runner, a
++        # test execution — recorded in both evidence categories so
++        # completion rules that look for either are satisfied honestly,
++        # keyed on whether the change was actually kept or rolled back.
++        evidence.setdefault("transactional edits", []).append(evidence_record)
++
++        kept = result.get("kept", False)
++        test_command = result.get("test_command", "")
++
++        if is_test_command(test_command):
++            test_bucket = (
++                "test execution result" if kept
++                else "failed test execution"
++            )
++            evidence.setdefault(test_bucket, []).append(evidence_record)
++
+ def check_success(success_definition, evidence):
+     required = success_definition["required_evidence"]
+     missing = []
+@@ -910,6 +983,26 @@ def build_evidence_summary(evidence):
+         lines.append(f"\nFAILED TEST COMMAND: {record['arguments'].get('command', 'unknown')}")
+         lines.append(f"Test runner output: {record['result']!r}")
+ 
++    for record in evidence.get("transactional edits", []):
++        result = record["result"] if isinstance(record["result"], dict) else {}
++        filename = result.get("filename", record["arguments"].get("filename", "unknown"))
++        if result.get("kept"):
++            lines.append(
++                f"\nTRANSACTIONAL EDIT KEPT: {filename} — verified by "
++                f"'{result.get('test_command', 'unknown')}' (exit code "
++                f"{result.get('test_exit_code')})."
++            )
++        else:
++            lines.append(
++                f"\nTRANSACTIONAL EDIT ROLLED BACK: {filename} — the "
++                f"change failed its verification command "
++                f"('{result.get('test_command', 'unknown')}', exit code "
++                f"{result.get('test_exit_code')}) and Forge restored the "
++                f"file to what it contained before this edit. The new "
++                f"content was NOT kept."
++            )
++            lines.append(f"Test stderr: {result.get('test_stderr', '')!r}")
++
+     lines.append(
+         "\nA successful command exit does not by itself prove "
+         "that tests passed."
+@@ -945,6 +1038,9 @@ INSTRUCTIONS:
+ - Distinguish source code from observed execution.
+ - Do not claim a function ran merely because it is defined.
+ - Do not claim tests passed unless test results explicitly support that.
++- If a transactional edit was rolled back, say plainly that the change
++  was NOT kept and the file was restored — never describe a rolled-back
++  edit as if it is now in the workspace.
+ - Do not invent files, commands, output, or observations.
+ - If completion is INCOMPLETE, clearly state what remains unverified.
+ - Do not request tools or produce JSON tool calls.
+@@ -984,6 +1080,7 @@ def run_task(prompt, max_steps=20, max_stalls=3):
+         "workspace file listing": [],
+         "failed command execution": [],
+         "failed test execution": [],
++        "transactional edits": [],
+     }
+     tool_history = []
+     tool_cache = {}
+diff --git a/test_forge.py b/test_forge.py
+index da86c03..3acde59 100644
+--- a/test_forge.py
++++ b/test_forge.py
+@@ -402,6 +402,99 @@ class TestFoundationsSlice(unittest.TestCase):
+         finally:
+             forge.messages[:] = original_messages
+ 
++    def test_apply_change_with_test_keeps_passing_change_end_to_end(self):
++        import contextlib
++        import io
++        from unittest.mock import patch
++        from pathlib import Path
++        from tempfile import TemporaryDirectory
++
++        responses = iter([
++            '{"tool":"apply_change_with_test","arguments":'
++            '{"filename":"calc.py","content":"def add(x, y):\\n    return x + y\\n",'
++            '"test_command":"python3 -m unittest test_calc"}}',
++            "The change was applied and the test passed.",
++        ])
++        original_messages = list(forge.messages)
++        try:
++            with TemporaryDirectory() as tmp:
++                workspace = Path(tmp)
++                (workspace / "test_calc.py").write_text(
++                    "import unittest\nfrom calc import add\n\n"
++                    "class T(unittest.TestCase):\n"
++                    "    def test_add(self):\n"
++                    "        self.assertEqual(add(1, 2), 3)\n"
++                )
++                with patch.object(forge, "WORKSPACE", workspace), patch.object(
++                    forge, "ask_model", side_effect=lambda: next(responses)
++                ), patch("run_record.RUNS_DIR", workspace / "_runs"), \
++                        contextlib.redirect_stdout(io.StringIO()):
++                    result = forge.run_task(
++                        "add a working add() function to calc.py and verify it",
++                        max_steps=5,
++                    )
++
++                self.assertEqual(
++                    (workspace / "calc.py").read_text(),
++                    "def add(x, y):\n    return x + y\n",
++                )
++                self.assertEqual(len(result["evidence"]["transactional edits"]), 1)
++                edit = result["evidence"]["transactional edits"][0]["result"]
++                self.assertTrue(edit["kept"])
++        finally:
++            forge.messages[:] = original_messages
++
++    def test_apply_change_with_test_rolls_back_failing_change_end_to_end(self):
++        import contextlib
++        import io
++        from unittest.mock import patch
++        from pathlib import Path
++        from tempfile import TemporaryDirectory
++
++        responses = iter([
++            '{"tool":"apply_change_with_test","arguments":'
++            '{"filename":"calc.py","content":"def add(x, y):\\n    return x - y\\n",'
++            '"test_command":"python3 -m unittest test_calc"}}',
++            "The change broke the test and was rolled back.",
++        ])
++        original_messages = list(forge.messages)
++        try:
++            with TemporaryDirectory() as tmp:
++                workspace = Path(tmp)
++                (workspace / "calc.py").write_text(
++                    "def add(x, y):\n    return x + y\n"
++                )
++                (workspace / "test_calc.py").write_text(
++                    "import unittest\nfrom calc import add\n\n"
++                    "class T(unittest.TestCase):\n"
++                    "    def test_add(self):\n"
++                    "        self.assertEqual(add(1, 2), 3)\n"
++                )
++                with patch.object(forge, "WORKSPACE", workspace), patch.object(
++                    forge, "ask_model", side_effect=lambda: next(responses)
++                ), patch("run_record.RUNS_DIR", workspace / "_runs"), \
++                        contextlib.redirect_stdout(io.StringIO()):
++                    result = forge.run_task(
++                        "fix add() in calc.py and verify it", max_steps=5,
++                    )
++
++                # The broken "fix" must never survive — original content
++                # must be exactly restored.
++                self.assertEqual(
++                    (workspace / "calc.py").read_text(),
++                    "def add(x, y):\n    return x + y\n",
++                )
++                edit = result["evidence"]["transactional edits"][0]["result"]
++                self.assertFalse(edit["kept"])
++                self.assertTrue(edit["rolled_back"])
++                self.assertEqual(len(result["evidence"]["failed test execution"]), 1)
++
++                # The grounded summary must say it was rolled back, not kept.
++                summary = forge.build_evidence_summary(result["evidence"])
++                self.assertIn("ROLLED BACK", summary)
++        finally:
++            forge.messages[:] = original_messages
++
+ 
+ if __name__ == "__main__":
+     unittest.main()
+diff --git a/test_transactions.py b/test_transactions.py
+new file mode 100644
+index 0000000..49b3646
+--- /dev/null
++++ b/test_transactions.py
+@@ -0,0 +1,97 @@
++import unittest
++from pathlib import Path
++from tempfile import TemporaryDirectory
++
++import sandbox
++import transactions
++
++
++class TestApplyChangeWithTest(unittest.TestCase):
++    def setUp(self):
++        self.backend = sandbox.RestrictedLocalBackend()
++
++    def test_keeps_change_when_test_passes(self):
++        with TemporaryDirectory() as tmp:
++            workspace = Path(tmp)
++            result = transactions.apply_change_with_test(
++                workspace, "a.py", "x = 1\n", "exit 0", self.backend,
++            )
++            self.assertTrue(result["kept"])
++            self.assertFalse(result["rolled_back"])
++            self.assertEqual((workspace / "a.py").read_text(), "x = 1\n")
++
++    def test_rolls_back_existing_file_when_test_fails(self):
++        with TemporaryDirectory() as tmp:
++            workspace = Path(tmp)
++            (workspace / "a.py").write_text("x = 0\n")
++
++            result = transactions.apply_change_with_test(
++                workspace, "a.py", "x = 1\n", "exit 1", self.backend,
++            )
++
++            self.assertFalse(result["kept"])
++            self.assertTrue(result["rolled_back"])
++            self.assertTrue(result["previous_existed"])
++            # File must be restored to exactly what it was before.
++            self.assertEqual((workspace / "a.py").read_text(), "x = 0\n")
++
++    def test_deletes_new_file_when_test_fails(self):
++        with TemporaryDirectory() as tmp:
++            workspace = Path(tmp)
++            # a.py does not exist yet.
++            result = transactions.apply_change_with_test(
++                workspace, "a.py", "x = 1\n", "exit 1", self.backend,
++            )
++
++            self.assertFalse(result["kept"])
++            self.assertFalse(result["previous_existed"])
++            self.assertFalse((workspace / "a.py").exists())
++
++    def test_rejects_path_outside_workspace(self):
++        with TemporaryDirectory() as tmp:
++            workspace = Path(tmp)
++            with self.assertRaises(ValueError):
++                transactions.apply_change_with_test(
++                    workspace, "../escape.py", "x = 1\n", "exit 0", self.backend,
++                )
++
++    def test_reports_actual_exit_code_and_output(self):
++        with TemporaryDirectory() as tmp:
++            workspace = Path(tmp)
++            result = transactions.apply_change_with_test(
++                workspace, "a.py", "x = 1\n",
++                "python3 -c \"import sys; print('boom'); sys.exit(3)\"",
++                self.backend,
++            )
++            self.assertFalse(result["kept"])
++            self.assertEqual(result["test_exit_code"], 3)
++            self.assertIn("boom", result["test_stdout"])
++
++    def test_real_failing_test_suite_triggers_rollback(self):
++        with TemporaryDirectory() as tmp:
++            workspace = Path(tmp)
++            (workspace / "calc.py").write_text(
++                "def add(x, y):\n    return x + y\n"
++            )
++            (workspace / "test_calc.py").write_text(
++                "import unittest\nfrom calc import add\n\n"
++                "class T(unittest.TestCase):\n"
++                "    def test_add(self):\n"
++                "        self.assertEqual(add(1, 2), 3)\n"
++            )
++
++            # A "fix" that actually breaks the function.
++            result = transactions.apply_change_with_test(
++                workspace, "calc.py", "def add(x, y):\n    return x - y\n",
++                "python3 -m unittest test_calc", self.backend,
++            )
++
++            self.assertFalse(result["kept"])
++            self.assertEqual(
++                (workspace / "calc.py").read_text(),
++                "def add(x, y):\n    return x + y\n",
++            )
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/transactions.py b/transactions.py
+new file mode 100644
+index 0000000..7710861
+--- /dev/null
++++ b/transactions.py
+@@ -0,0 +1,78 @@
++"""
++transactions.py — transactional code editing: edit -> test -> keep/rollback.
++
++This closes the last open item from Phase 01's known limitations:
++"transactional code editing (edit -> test -> keep/rollback)".
++
++Before this, a code change went through Forge as two or three
++independent tool calls (write_file, then maybe run_command). Nothing
++guaranteed the model would actually run the verifying command, and if
++the change broke something, nothing undid it — a bad edit just sat in
++the workspace as the new, broken state, with "rollback" being a thing
++a human would have to notice and do by hand.
++
++`apply_change_with_test` makes edit+verify+rollback a single atomic
++runtime operation instead of a multi-step pattern the model has to be
++trusted to follow correctly:
++
++  1. Snapshot the file's current content (or note that it didn't exist).
++  2. Write the new content.
++  3. Run the verifying command through the real sandbox backend.
++  4. If it exits 0: keep the change.
++     If it doesn't: restore the exact previous content (or delete the
++     file, if it didn't exist before this call) and report the failure.
++
++The caller (forge.py) supplies the already-selected sandbox backend, so
++this module stays backend-agnostic and easy to test without touching
++sandbox selection at all.
++"""
++
++from __future__ import annotations
++
++from pathlib import Path
++from typing import Any
++
++
++def apply_change_with_test(
++    workspace: Path,
++    filename: str,
++    content: str,
++    test_command: str,
++    backend,
++    timeout: int = 30,
++) -> dict[str, Any]:
++    workspace = workspace.resolve()
++    path = (workspace / filename).resolve()
++
++    if not path.is_relative_to(workspace):
++        raise ValueError("Access outside workspace is not allowed")
++
++    previous_existed = path.is_file()
++    previous_content = path.read_text(encoding="utf-8") if previous_existed else None
++
++    path.parent.mkdir(parents=True, exist_ok=True)
++    path.write_text(content, encoding="utf-8")
++
++    test_result = backend.run(test_command, workspace, timeout=timeout)
++    kept = test_result.exit_code == 0
++
++    if not kept:
++        # Roll back to exactly what was there before — restore the prior
++        # content, or remove the file entirely if this call created it.
++        if previous_existed:
++            path.write_text(previous_content, encoding="utf-8")
++        else:
++            path.unlink(missing_ok=True)
++
++    return {
++        "filename": filename,
++        "kept": kept,
++        "rolled_back": not kept,
++        "previous_existed": previous_existed,
++        "test_command": test_command,
++        "test_exit_code": test_result.exit_code,
++        "test_stdout": test_result.stdout,
++        "test_stderr": test_result.stderr,
++        "test_timed_out": test_result.timed_out,
++        "backend": test_result.backend,
++    }
+-- 
+2.43.0

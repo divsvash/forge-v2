@@ -8,6 +8,7 @@ from pathlib import Path
 from dataclasses import dataclass
 
 import sandbox
+import transactions
 from run_record import new_run, ToolCallRecord
 
 success_definition = None
@@ -82,6 +83,17 @@ def run_command(command):
     backend = get_backend()
     result = backend.run(command, WORKSPACE, timeout=30)
     return result.as_dict()
+
+def apply_change_with_test(filename, content, test_command):
+    """Write `content` to `filename`, run `test_command`, and keep the
+    change only if it exits 0 — otherwise restore the file to exactly
+    what it was before (or delete it, if this call created it). See
+    transactions.py for why this is one atomic tool rather than a
+    write_file + run_command sequence the model has to get right."""
+    backend = get_backend()
+    return transactions.apply_change_with_test(
+        WORKSPACE, filename, content, test_command, backend, timeout=30
+    )
 
 def search_files(query):
     matches = []
@@ -183,6 +195,21 @@ TOOLS = {
         },
         risk="read",
         sandboxed=False,
+    ),
+    "apply_change_with_test": ToolSpec(
+        name="apply_change_with_test",
+        func=apply_change_with_test,
+        schema={
+            "type": "object",
+            "properties": {
+                "filename": {"type": "string"},
+                "content": {"type": "string"},
+                "test_command": {"type": "string"},
+            },
+            "required": ["filename", "content", "test_command"],
+        },
+        risk="write",
+        sandboxed=True,
     ),
 }
 
@@ -324,6 +351,20 @@ Searches the contents of files inside the Forge workspace for a text query.
 Argument:
 - query: text to search for
 
+apply_change_with_test:
+Writes a file and immediately verifies it with a test command, as a
+single atomic operation. If the test command exits 0, the change is
+kept. If it does not, Forge automatically restores the file to exactly
+what it contained before this call (or deletes it, if the file did not
+exist before). Use this instead of write_file whenever a change should
+be verified before it is kept — do not follow it with a second,
+separate run_command to "double check": the verification already
+happened, and the result tells you whether the change survived.
+Arguments:
+- filename: path relative to the workspace
+- content: complete new contents to write
+- test_command: command to run to verify the change (e.g. a test runner)
+
 TOOL PROTOCOL:
 
 You may REQUEST tools. You do not execute tools yourself.
@@ -414,6 +455,17 @@ Another example:
   "tool": "search_files",
   "arguments": {
     "query": "factorial"
+  }
+}
+
+Another example:
+
+{
+  "tool": "apply_change_with_test",
+  "arguments": {
+    "filename": "factorial.py",
+    "content": "def factorial(n):\n    return 1 if n <= 1 else n * factorial(n - 1)\n",
+    "test_command": "python -m unittest test_factorial"
   }
 }
 
@@ -568,6 +620,27 @@ def record_evidence(evidence, tool_name, arguments, result):
         if is_test_command(command):
             test_bucket = (
                 "test execution result" if succeeded
+                else "failed test execution"
+            )
+            evidence.setdefault(test_bucket, []).append(evidence_record)
+
+    elif tool_name == "apply_change_with_test":
+        if not isinstance(result, dict):
+            return
+
+        # A transactional edit is itself a write (something changed in
+        # the workspace) and, when its command is a real test runner, a
+        # test execution — recorded in both evidence categories so
+        # completion rules that look for either are satisfied honestly,
+        # keyed on whether the change was actually kept or rolled back.
+        evidence.setdefault("transactional edits", []).append(evidence_record)
+
+        kept = result.get("kept", False)
+        test_command = result.get("test_command", "")
+
+        if is_test_command(test_command):
+            test_bucket = (
+                "test execution result" if kept
                 else "failed test execution"
             )
             evidence.setdefault(test_bucket, []).append(evidence_record)
@@ -910,6 +983,26 @@ def build_evidence_summary(evidence):
         lines.append(f"\nFAILED TEST COMMAND: {record['arguments'].get('command', 'unknown')}")
         lines.append(f"Test runner output: {record['result']!r}")
 
+    for record in evidence.get("transactional edits", []):
+        result = record["result"] if isinstance(record["result"], dict) else {}
+        filename = result.get("filename", record["arguments"].get("filename", "unknown"))
+        if result.get("kept"):
+            lines.append(
+                f"\nTRANSACTIONAL EDIT KEPT: {filename} — verified by "
+                f"'{result.get('test_command', 'unknown')}' (exit code "
+                f"{result.get('test_exit_code')})."
+            )
+        else:
+            lines.append(
+                f"\nTRANSACTIONAL EDIT ROLLED BACK: {filename} — the "
+                f"change failed its verification command "
+                f"('{result.get('test_command', 'unknown')}', exit code "
+                f"{result.get('test_exit_code')}) and Forge restored the "
+                f"file to what it contained before this edit. The new "
+                f"content was NOT kept."
+            )
+            lines.append(f"Test stderr: {result.get('test_stderr', '')!r}")
+
     lines.append(
         "\nA successful command exit does not by itself prove "
         "that tests passed."
@@ -945,6 +1038,9 @@ INSTRUCTIONS:
 - Distinguish source code from observed execution.
 - Do not claim a function ran merely because it is defined.
 - Do not claim tests passed unless test results explicitly support that.
+- If a transactional edit was rolled back, say plainly that the change
+  was NOT kept and the file was restored — never describe a rolled-back
+  edit as if it is now in the workspace.
 - Do not invent files, commands, output, or observations.
 - If completion is INCOMPLETE, clearly state what remains unverified.
 - Do not request tools or produce JSON tool calls.
@@ -984,6 +1080,7 @@ def run_task(prompt, max_steps=20, max_stalls=3):
         "workspace file listing": [],
         "failed command execution": [],
         "failed test execution": [],
+        "transactional edits": [],
     }
     tool_history = []
     tool_cache = {}

@@ -402,6 +402,99 @@ class TestFoundationsSlice(unittest.TestCase):
         finally:
             forge.messages[:] = original_messages
 
+    def test_apply_change_with_test_keeps_passing_change_end_to_end(self):
+        import contextlib
+        import io
+        from unittest.mock import patch
+        from pathlib import Path
+        from tempfile import TemporaryDirectory
+
+        responses = iter([
+            '{"tool":"apply_change_with_test","arguments":'
+            '{"filename":"calc.py","content":"def add(x, y):\\n    return x + y\\n",'
+            '"test_command":"python3 -m unittest test_calc"}}',
+            "The change was applied and the test passed.",
+        ])
+        original_messages = list(forge.messages)
+        try:
+            with TemporaryDirectory() as tmp:
+                workspace = Path(tmp)
+                (workspace / "test_calc.py").write_text(
+                    "import unittest\nfrom calc import add\n\n"
+                    "class T(unittest.TestCase):\n"
+                    "    def test_add(self):\n"
+                    "        self.assertEqual(add(1, 2), 3)\n"
+                )
+                with patch.object(forge, "WORKSPACE", workspace), patch.object(
+                    forge, "ask_model", side_effect=lambda: next(responses)
+                ), patch("run_record.RUNS_DIR", workspace / "_runs"), \
+                        contextlib.redirect_stdout(io.StringIO()):
+                    result = forge.run_task(
+                        "add a working add() function to calc.py and verify it",
+                        max_steps=5,
+                    )
+
+                self.assertEqual(
+                    (workspace / "calc.py").read_text(),
+                    "def add(x, y):\n    return x + y\n",
+                )
+                self.assertEqual(len(result["evidence"]["transactional edits"]), 1)
+                edit = result["evidence"]["transactional edits"][0]["result"]
+                self.assertTrue(edit["kept"])
+        finally:
+            forge.messages[:] = original_messages
+
+    def test_apply_change_with_test_rolls_back_failing_change_end_to_end(self):
+        import contextlib
+        import io
+        from unittest.mock import patch
+        from pathlib import Path
+        from tempfile import TemporaryDirectory
+
+        responses = iter([
+            '{"tool":"apply_change_with_test","arguments":'
+            '{"filename":"calc.py","content":"def add(x, y):\\n    return x - y\\n",'
+            '"test_command":"python3 -m unittest test_calc"}}',
+            "The change broke the test and was rolled back.",
+        ])
+        original_messages = list(forge.messages)
+        try:
+            with TemporaryDirectory() as tmp:
+                workspace = Path(tmp)
+                (workspace / "calc.py").write_text(
+                    "def add(x, y):\n    return x + y\n"
+                )
+                (workspace / "test_calc.py").write_text(
+                    "import unittest\nfrom calc import add\n\n"
+                    "class T(unittest.TestCase):\n"
+                    "    def test_add(self):\n"
+                    "        self.assertEqual(add(1, 2), 3)\n"
+                )
+                with patch.object(forge, "WORKSPACE", workspace), patch.object(
+                    forge, "ask_model", side_effect=lambda: next(responses)
+                ), patch("run_record.RUNS_DIR", workspace / "_runs"), \
+                        contextlib.redirect_stdout(io.StringIO()):
+                    result = forge.run_task(
+                        "fix add() in calc.py and verify it", max_steps=5,
+                    )
+
+                # The broken "fix" must never survive — original content
+                # must be exactly restored.
+                self.assertEqual(
+                    (workspace / "calc.py").read_text(),
+                    "def add(x, y):\n    return x + y\n",
+                )
+                edit = result["evidence"]["transactional edits"][0]["result"]
+                self.assertFalse(edit["kept"])
+                self.assertTrue(edit["rolled_back"])
+                self.assertEqual(len(result["evidence"]["failed test execution"]), 1)
+
+                # The grounded summary must say it was rolled back, not kept.
+                summary = forge.build_evidence_summary(result["evidence"])
+                self.assertIn("ROLLED BACK", summary)
+        finally:
+            forge.messages[:] = original_messages
+
 
 if __name__ == "__main__":
     unittest.main()

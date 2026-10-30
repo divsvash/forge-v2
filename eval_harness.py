@@ -34,6 +34,7 @@ from unittest.mock import patch
 
 import forge
 import run_record
+import memory
 
 
 @dataclass
@@ -66,10 +67,12 @@ def run_case(case: TaskCase, run_task_fn=None) -> CaseResult:
 
         patches = [
             patch.object(forge, "WORKSPACE", workspace),
-            # Keep each case's run record inside its own scratch dir —
-            # otherwise every eval run would write real run records into
-            # the repo's runs/ directory.
+            # Keep each case's run record and project memory inside its
+            # own scratch dir — otherwise every eval run would write
+            # real run records / memory entries into the repo's own
+            # runs/ directory and forge_memory.db.
             patch.object(run_record, "RUNS_DIR", workspace / "_runs"),
+            patch.object(memory, "DB_PATH", workspace / "_memory.db"),
         ]
         if case.scripted_responses is not None:
             responses = iter(case.scripted_responses)

@@ -198,6 +198,7 @@ class TestForgeIntegration(unittest.TestCase):
                 with patch.object(forge, "WORKSPACE", workspace), patch.object(
                     forge, "ask_model", side_effect=lambda: next(responses)
                 ), patch("run_record.RUNS_DIR", workspace / "_runs"), \
+                        patch("memory.DB_PATH", workspace / "_memory.db"), \
                         contextlib.redirect_stdout(io.StringIO()):
                     result = forge.run_task(
                         "find where hello is used, inspect the relevant files", max_steps=20
@@ -262,6 +263,14 @@ class TestFoundationsSlice(unittest.TestCase):
         self.assertNotIn("failed command execution", evidence)
 
     def test_messages_do_not_leak_between_tasks(self):
+        """The bug this guards against: `messages` is a module-level
+        list, and used to accumulate raw conversation across every
+        run_task() call in the same process, so task 2 could see task
+        1's entire exchange verbatim. That must stay fixed regardless of
+        the (separate, intentional) project-memory recall added later:
+        each task's `messages` must start fresh, containing only this
+        task's own prompt text as the ORIGINAL unrelated task's literal
+        prompt — not the first task's full user-supplied sentence."""
         import contextlib
         import io
         from unittest.mock import patch
@@ -274,6 +283,7 @@ class TestFoundationsSlice(unittest.TestCase):
                 with patch.object(forge, "WORKSPACE", Path(tmp)), patch.object(
                     forge, "ask_model", return_value="Noted."
                 ), patch("run_record.RUNS_DIR", Path(tmp) / "runs"), \
+                        patch("memory.DB_PATH", Path(tmp) / "_memory.db"), \
                         contextlib.redirect_stdout(io.StringIO()):
                     forge.run_task(
                         "remember the secret word banana", max_steps=5, max_stalls=1
@@ -282,14 +292,120 @@ class TestFoundationsSlice(unittest.TestCase):
                         "what did I just ask about?", max_steps=5, max_stalls=1
                     )
 
-            task_contents = [
+            # The second task's raw conversation must not contain the
+            # first task's prompt as a literal message of its own — the
+            # old leak would have appended it verbatim as a prior
+            # "user"-role turn in the same growing list.
+            raw_user_messages = [
                 m["content"] for m in forge.messages if m["role"] == "user"
             ]
             self.assertTrue(
-                any("what did I just ask" in c for c in task_contents)
+                any("what did I just ask" in c for c in raw_user_messages)
             )
+            self.assertNotIn(
+                "remember the secret word banana", raw_user_messages
+            )
+        finally:
+            forge.messages[:] = original_messages
+
+    def test_project_memory_does_not_leak_across_different_projects(self):
+        """Two different workspaces are two different projects. A fact
+        remembered while working in one must never surface in the
+        other's recalled context — memory is scoped per project, not
+        global to the process."""
+        import contextlib
+        import io
+        from unittest.mock import patch
+        from pathlib import Path
+        from tempfile import TemporaryDirectory
+
+        responses = iter([
+            '{"tool":"remember","arguments":{"kind":"fact",'
+            '"content":"project A uses PostgreSQL"}}',
+            "Noted.",
+            "Nothing relevant recalled.",
+        ])
+        original_messages = list(forge.messages)
+        try:
+            with TemporaryDirectory() as tmp_a, TemporaryDirectory() as tmp_b:
+                db_path = Path(tmp_a) / "_shared_memory.db"
+                with patch.object(forge, "WORKSPACE", Path(tmp_a)), patch.object(
+                    forge, "ask_model", side_effect=lambda: next(responses)
+                ), patch("run_record.RUNS_DIR", Path(tmp_a) / "runs"), \
+                        patch("memory.DB_PATH", db_path), \
+                        contextlib.redirect_stdout(io.StringIO()):
+                    forge.run_task(
+                        "remember that this project uses PostgreSQL",
+                        max_steps=5, max_stalls=1,
+                    )
+
+                with patch.object(forge, "WORKSPACE", Path(tmp_b)), patch.object(
+                    forge, "ask_model", return_value="Nothing relevant recalled."
+                ), patch("run_record.RUNS_DIR", Path(tmp_b) / "runs"), \
+                        patch("memory.DB_PATH", db_path), \
+                        contextlib.redirect_stdout(io.StringIO()):
+                    forge.run_task(
+                        "what database does this project use?",
+                        max_steps=5, max_stalls=1,
+                    )
+
+            project_b_context = [
+                m["content"] for m in forge.messages
+                if m["role"] == "user" and "PROJECT MEMORY" in m["content"]
+            ]
             self.assertFalse(
-                any("secret word banana" in c for c in task_contents)
+                any("PostgreSQL" in c for c in project_b_context)
+            )
+        finally:
+            forge.messages[:] = original_messages
+
+    def test_project_memory_carries_forward_within_same_project(self):
+        """Within the SAME project (same workspace), a fact remembered
+        in one task is deliberately recalled into the next task's
+        context — this is the intended Phase 02 behavior ("we stop
+        starting from zero every session"), labeled explicitly as
+        project memory rather than silently merged into raw chat."""
+        import contextlib
+        import io
+        from unittest.mock import patch
+        from pathlib import Path
+        from tempfile import TemporaryDirectory
+
+        responses = iter([
+            '{"tool":"remember","arguments":{"kind":"fact",'
+            '"content":"the project uses PostgreSQL"}}',
+            "Noted.",
+            "This project uses PostgreSQL.",
+        ])
+        original_messages = list(forge.messages)
+        try:
+            with TemporaryDirectory() as tmp:
+                workspace = Path(tmp)
+                with patch.object(forge, "WORKSPACE", workspace), patch.object(
+                    forge, "ask_model", side_effect=lambda: next(responses)
+                ), patch("run_record.RUNS_DIR", workspace / "runs"), \
+                        patch("memory.DB_PATH", workspace / "_memory.db"), \
+                        contextlib.redirect_stdout(io.StringIO()):
+                    forge.run_task(
+                        "remember that this project uses PostgreSQL",
+                        max_steps=5, max_stalls=1,
+                    )
+                    forge.run_task(
+                        "what database does this project use?",
+                        max_steps=5, max_stalls=1,
+                    )
+
+            project_memory_messages = [
+                m["content"] for m in forge.messages
+                if m["role"] == "user" and "PROJECT MEMORY" in m["content"]
+            ]
+            self.assertTrue(
+                any("PostgreSQL" in c for c in project_memory_messages)
+            )
+            # It must be clearly labeled by kind, not presented as a raw
+            # repeat of the earlier conversation.
+            self.assertTrue(
+                any("[FACT]" in c for c in project_memory_messages)
             )
         finally:
             forge.messages[:] = original_messages
@@ -309,6 +425,7 @@ class TestFoundationsSlice(unittest.TestCase):
                 with patch.object(forge, "WORKSPACE", Path(tmp)), patch.object(
                     forge, "ask_model", return_value="Final answer."
                 ), patch("run_record.RUNS_DIR", runs_dir), \
+                        patch("memory.DB_PATH", Path(tmp) / "_memory.db"), \
                         contextlib.redirect_stdout(io.StringIO()):
                     result = forge.run_task("a trivial task")
 
@@ -340,6 +457,7 @@ class TestFoundationsSlice(unittest.TestCase):
                 with patch.object(forge, "WORKSPACE", Path(tmp)), patch.object(
                     forge, "ask_model", side_effect=lambda: next(responses)
                 ), patch("run_record.RUNS_DIR", Path(tmp) / "runs"), \
+                        patch("memory.DB_PATH", Path(tmp) / "_memory.db"), \
                         contextlib.redirect_stdout(io.StringIO()):
                     result = forge.run_task("read missing.py", max_steps=5)
 
@@ -382,6 +500,7 @@ class TestFoundationsSlice(unittest.TestCase):
                             forge, "ask_model", side_effect=lambda: next(responses)
                         ), \
                         patch("run_record.RUNS_DIR", workspace / "_runs"), \
+                        patch("memory.DB_PATH", workspace / "_memory.db"), \
                         contextlib.redirect_stdout(io.StringIO()):
                     result = forge.run_task(
                         "inspect the contents of one.py", max_steps=10
@@ -428,6 +547,7 @@ class TestFoundationsSlice(unittest.TestCase):
                 with patch.object(forge, "WORKSPACE", workspace), patch.object(
                     forge, "ask_model", side_effect=lambda: next(responses)
                 ), patch("run_record.RUNS_DIR", workspace / "_runs"), \
+                        patch("memory.DB_PATH", workspace / "_memory.db"), \
                         contextlib.redirect_stdout(io.StringIO()):
                     result = forge.run_task(
                         "add a working add() function to calc.py and verify it",
@@ -473,6 +593,7 @@ class TestFoundationsSlice(unittest.TestCase):
                 with patch.object(forge, "WORKSPACE", workspace), patch.object(
                     forge, "ask_model", side_effect=lambda: next(responses)
                 ), patch("run_record.RUNS_DIR", workspace / "_runs"), \
+                        patch("memory.DB_PATH", workspace / "_memory.db"), \
                         contextlib.redirect_stdout(io.StringIO()):
                     result = forge.run_task(
                         "fix add() in calc.py and verify it", max_steps=5,

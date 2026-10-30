@@ -9,6 +9,7 @@ from dataclasses import dataclass
 
 import sandbox
 import transactions
+import memory
 from run_record import new_run, ToolCallRecord
 
 success_definition = None
@@ -94,6 +95,55 @@ def apply_change_with_test(filename, content, test_command):
     return transactions.apply_change_with_test(
         WORKSPACE, filename, content, test_command, backend, timeout=30
     )
+
+# ---------- PROJECT MEMORY ----------
+# Durable, per-workspace memory (memory.py / SQLite). _current_run_id is
+# set once per run_task() call so anything remembered during that task
+# carries its run's id as provenance — the same pattern get_backend()
+# uses to avoid threading extra parameters through every tool call.
+
+_current_run_id = None
+
+
+def get_project_id():
+    return memory.get_or_create_project(WORKSPACE)
+
+
+def remember_fact(kind, content):
+    """Durably record something about this project. kind must be one of
+    fact, assumption, or decision — never store a guess as a fact."""
+    if kind not in ("fact", "assumption", "decision"):
+        raise ValueError(
+            "kind must be 'fact', 'assumption', or 'decision' "
+            "(task summaries are recorded automatically by the runtime)"
+        )
+    entry_id = memory.remember(
+        get_project_id(), kind, content,
+        source="forge-task", run_id=_current_run_id,
+    )
+    return {"remembered": True, "kind": kind, "entry_id": entry_id}
+
+
+def recall_memory(kind=None, query=None, limit=10):
+    """Retrieve durable memory for this project from prior sessions.
+    Pass `query` to search by substring, or `kind` to filter by
+    fact/assumption/decision/task_summary; omit both for the most
+    recent entries of any kind."""
+    project_id = get_project_id()
+    if query:
+        entries = memory.search(project_id, query)
+    else:
+        entries = memory.recall(project_id, kind=kind, limit=limit)
+
+    return [
+        {
+            "kind": entry.kind,
+            "content": entry.content,
+            "source": entry.source,
+            "created_at": entry.created_at,
+        }
+        for entry in entries
+    ]
 
 def search_files(query):
     matches = []
@@ -210,6 +260,37 @@ TOOLS = {
         },
         risk="write",
         sandboxed=True,
+    ),
+    "remember": ToolSpec(
+        name="remember",
+        func=remember_fact,
+        schema={
+            "type": "object",
+            "properties": {
+                "kind": {"type": "string", "enum": ["fact", "assumption", "decision"]},
+                "content": {"type": "string"},
+            },
+            "required": ["kind", "content"],
+        },
+        risk="write",
+        sandboxed=False,
+    ),
+    "recall": ToolSpec(
+        name="recall",
+        func=recall_memory,
+        schema={
+            "type": "object",
+            "properties": {
+                "kind": {
+                    "type": "string",
+                    "enum": ["fact", "assumption", "decision", "task_summary"],
+                },
+                "query": {"type": "string"},
+                "limit": {"type": "integer"},
+            },
+        },
+        risk="read",
+        sandboxed=False,
     ),
 }
 
@@ -365,6 +446,27 @@ Arguments:
 - content: complete new contents to write
 - test_command: command to run to verify the change (e.g. a test runner)
 
+remember:
+Durably records something about this project so it survives past this
+task, into future sessions. Use "fact" only for something established —
+stated directly by the user, or confirmed by actual tool evidence.
+Use "assumption" for something you are working from but have not
+confirmed. Use "decision" for a choice made about how to proceed and
+why. Never record a guess as a fact.
+Arguments:
+- kind: "fact", "assumption", or "decision"
+- content: the thing to remember, written so it stands alone later
+
+recall:
+Retrieves durable memory recorded about this project in past sessions.
+Use this when you need project context from before this task, or when
+the user refers to something you have no other record of. Omit all
+arguments to get the most recent entries of any kind.
+Arguments (all optional):
+- kind: "fact", "assumption", "decision", or "task_summary"
+- query: text to search for in remembered content
+- limit: maximum number of entries to return (default 10)
+
 TOOL PROTOCOL:
 
 You may REQUEST tools. You do not execute tools yourself.
@@ -466,6 +568,25 @@ Another example:
     "filename": "factorial.py",
     "content": "def factorial(n):\n    return 1 if n <= 1 else n * factorial(n - 1)\n",
     "test_command": "python -m unittest test_factorial"
+  }
+}
+
+Another example:
+
+{
+  "tool": "remember",
+  "arguments": {
+    "kind": "decision",
+    "content": "Using SQLite for persistent memory instead of flat JSON files, for queryable history."
+  }
+}
+
+Another example:
+
+{
+  "tool": "recall",
+  "arguments": {
+    "query": "database"
   }
 }
 
@@ -1088,6 +1209,32 @@ def run_task(prompt, max_steps=20, max_stalls=3):
     print("\n[Run ID]", run_record.run_id)
     print("\n[Success Definition]")
     print(success_definition)
+
+    # Make this run's id available to the remember/recall tools (same
+    # pattern as get_backend()'s module-level cache) so anything
+    # remembered during this task carries proper provenance.
+    global _current_run_id
+    _current_run_id = run_record.run_id
+
+    # Durable project memory from past sessions is injected as its own
+    # labeled context message, never merged into the raw conversation —
+    # this is deliberately NOT a return of the cross-task leak that was
+    # fixed earlier. That leak was the model's own unstructured chat
+    # history bleeding into unrelated tasks. This is a bounded, explicit
+    # set of entries, each tagged with its kind (fact/assumption/
+    # decision) and source, which the model can also fetch on demand
+    # via the recall tool.
+    try:
+        project_id = get_project_id()
+        recalled = memory.recall(project_id, limit=10)
+        context_block = memory.format_context(recalled)
+        if context_block:
+            print("\n[Project Memory]")
+            print(context_block)
+            messages.append({"role": "user", "content": context_block})
+    except Exception as error:
+        print(f"\n[Memory recall unavailable: {error}]")
+
     messages.append({"role": "user", "content": prompt})
 
     step = 0
@@ -1178,6 +1325,20 @@ def run_task(prompt, max_steps=20, max_stalls=3):
     )
     run_path = run_record.save()
     print(f"\n[Run Record] {run_path}")
+
+    # Record what happened as durable project memory — a task_summary
+    # entry, distinct from fact/assumption/decision, so a future task on
+    # this same project can recall what was already attempted without
+    # re-deriving it from scratch. Best-effort: memory unavailability
+    # must never fail an otherwise-completed task.
+    try:
+        memory.remember(
+            get_project_id(), "task_summary",
+            f"Task: {prompt}\nStatus: {run_status}\nAnswer: {answer[:1000]}",
+            source="forge-task", run_id=run_record.run_id,
+        )
+    except Exception as error:
+        print(f"\n[Memory write unavailable: {error}]")
 
     return {"completion": completion, "evidence": evidence, "answer": answer,
             "steps": step, "tool_history": tool_history, "run_id": run_record.run_id,

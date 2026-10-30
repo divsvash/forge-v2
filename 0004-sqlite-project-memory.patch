@@ -1,0 +1,989 @@
+From abb26a08483cc05af1b6bcced519299c00527940 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 30 Oct 2026 20:01:07 +0000
+Subject: [PATCH] Phase 02 foundation: durable SQLite project memory
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Starts "Forge's Brain" / the everyday-agent phase. Before this, every
+bit of Forge's state (messages, evidence) was in-memory only and
+discarded when the process exited or a new task started — "no
+persistent project memory" was an explicit known limitation.
+
+memory.py: project-scoped durable memory backed by SQLite.
+- get_or_create_project(workspace_path) maps a resolved workspace path
+  to a stable project id across restarts.
+- remember(project_id, kind, content, source, run_id) records a
+  fact, assumption, decision, or task_summary. kind is validated —
+  "fact" is not interchangeable with "assumption": the distinction the
+  vision doc calls for (distinguish facts from assumptions) is
+  enforced, not just suggested.
+- supersede(entry_id, new_content, ...) replaces an entry when new
+  evidence contradicts it. The old entry is kept (active=0,
+  superseded_by=<new id>), never deleted or overwritten in place, so
+  history(project_id) gives an actual decision/fact timeline, not just
+  a current snapshot.
+- recall(project_id, kind=, limit=, query=) retrieves active entries;
+  search() does substring matching over content.
+- format_context() renders entries labeled by kind, for injecting into
+  a task's context without pretending an assumption is a fact.
+
+forge.py integration:
+- Two new tools: `remember` (kind: fact|assumption|decision + content)
+  and `recall` (kind/query/limit, all optional) — the model can
+  explicitly store and retrieve project memory mid-task.
+- run_task() recalls the 10 most recent memory entries for the current
+  project and injects them as a separate, explicitly labeled
+  "PROJECT MEMORY" message before the task prompt — distinct from (and
+  not a reversal of) the earlier fix that stops raw conversation from
+  leaking between unrelated tasks. That fix stays intact: `messages`
+  still resets to just the system prompt every call. This is a
+  deliberate, bounded, labeled channel for cross-session continuity,
+  which is the explicit Phase 02 goal ("we stop starting from zero
+  every session").
+- run_task() records a task_summary entry at the end of every run,
+  best-effort (memory unavailability never fails an otherwise-
+  completed task).
+
+Found and fixed a real bug while wiring this up: memory.py's functions
+originally defaulted to `db_path: Path = DB_PATH`, which binds DB_PATH's
+value at function-DEFINITION time. patch.object(memory, "DB_PATH", ...)
+in tests (or any runtime override) silently did nothing for callers
+using the default — tests ran against a live forge_memory.db in the
+repo root instead of an isolated one. Fixed by defaulting to None and
+resolving `memory.DB_PATH` inside each function body. Added
+test_patching_module_db_path_affects_calls_using_the_default as a
+regression guard, verified to actually fail against the old pattern
+before confirming the fix.
+
+test_memory.py (12 tests): project identity per workspace, kind
+validation, supersede/history correctness, recall filtering/ordering,
+search, cross-restart persistence (literally reopening the connection),
+and the db_path-patching regression guard above.
+
+test_forge.py: replaced the single leak test with three — raw-message
+isolation across unrelated tasks (the original fix, confirmed intact),
+project memory NOT leaking across different workspaces/projects, and
+project memory correctly carrying forward within the SAME project
+(the new, intended behavior). Added memory.DB_PATH patches to every
+existing run_task()-driving test so none of them touch the real db.
+
+eval_harness.py: isolates memory.DB_PATH per case, same reasoning as
+the existing run_record.RUNS_DIR isolation.
+
+60/60 tests pass (46 prior + 14 new, across test_memory.py and
+additions to test_forge.py).
+
+Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01Nf1Av26L3kPBokvvZ1kN29
+---
+ eval_harness.py |   9 +-
+ forge.py        | 161 +++++++++++++++++++++++++++++
+ memory.py       | 267 ++++++++++++++++++++++++++++++++++++++++++++++++
+ test_forge.py   | 127 ++++++++++++++++++++++-
+ test_memory.py  | 178 ++++++++++++++++++++++++++++++++
+ 5 files changed, 736 insertions(+), 6 deletions(-)
+ create mode 100644 memory.py
+ create mode 100644 test_memory.py
+
+diff --git a/eval_harness.py b/eval_harness.py
+index b9cceca..cd0cef8 100644
+--- a/eval_harness.py
++++ b/eval_harness.py
+@@ -34,6 +34,7 @@ from unittest.mock import patch
+ 
+ import forge
+ import run_record
++import memory
+ 
+ 
+ @dataclass
+@@ -66,10 +67,12 @@ def run_case(case: TaskCase, run_task_fn=None) -> CaseResult:
+ 
+         patches = [
+             patch.object(forge, "WORKSPACE", workspace),
+-            # Keep each case's run record inside its own scratch dir —
+-            # otherwise every eval run would write real run records into
+-            # the repo's runs/ directory.
++            # Keep each case's run record and project memory inside its
++            # own scratch dir — otherwise every eval run would write
++            # real run records / memory entries into the repo's own
++            # runs/ directory and forge_memory.db.
+             patch.object(run_record, "RUNS_DIR", workspace / "_runs"),
++            patch.object(memory, "DB_PATH", workspace / "_memory.db"),
+         ]
+         if case.scripted_responses is not None:
+             responses = iter(case.scripted_responses)
+diff --git a/forge.py b/forge.py
+index 929feea..c23bac5 100644
+--- a/forge.py
++++ b/forge.py
+@@ -9,6 +9,7 @@ from dataclasses import dataclass
+ 
+ import sandbox
+ import transactions
++import memory
+ from run_record import new_run, ToolCallRecord
+ 
+ success_definition = None
+@@ -95,6 +96,55 @@ def apply_change_with_test(filename, content, test_command):
+         WORKSPACE, filename, content, test_command, backend, timeout=30
+     )
+ 
++# ---------- PROJECT MEMORY ----------
++# Durable, per-workspace memory (memory.py / SQLite). _current_run_id is
++# set once per run_task() call so anything remembered during that task
++# carries its run's id as provenance — the same pattern get_backend()
++# uses to avoid threading extra parameters through every tool call.
++
++_current_run_id = None
++
++
++def get_project_id():
++    return memory.get_or_create_project(WORKSPACE)
++
++
++def remember_fact(kind, content):
++    """Durably record something about this project. kind must be one of
++    fact, assumption, or decision — never store a guess as a fact."""
++    if kind not in ("fact", "assumption", "decision"):
++        raise ValueError(
++            "kind must be 'fact', 'assumption', or 'decision' "
++            "(task summaries are recorded automatically by the runtime)"
++        )
++    entry_id = memory.remember(
++        get_project_id(), kind, content,
++        source="forge-task", run_id=_current_run_id,
++    )
++    return {"remembered": True, "kind": kind, "entry_id": entry_id}
++
++
++def recall_memory(kind=None, query=None, limit=10):
++    """Retrieve durable memory for this project from prior sessions.
++    Pass `query` to search by substring, or `kind` to filter by
++    fact/assumption/decision/task_summary; omit both for the most
++    recent entries of any kind."""
++    project_id = get_project_id()
++    if query:
++        entries = memory.search(project_id, query)
++    else:
++        entries = memory.recall(project_id, kind=kind, limit=limit)
++
++    return [
++        {
++            "kind": entry.kind,
++            "content": entry.content,
++            "source": entry.source,
++            "created_at": entry.created_at,
++        }
++        for entry in entries
++    ]
++
+ def search_files(query):
+     matches = []
+ 
+@@ -211,6 +261,37 @@ TOOLS = {
+         risk="write",
+         sandboxed=True,
+     ),
++    "remember": ToolSpec(
++        name="remember",
++        func=remember_fact,
++        schema={
++            "type": "object",
++            "properties": {
++                "kind": {"type": "string", "enum": ["fact", "assumption", "decision"]},
++                "content": {"type": "string"},
++            },
++            "required": ["kind", "content"],
++        },
++        risk="write",
++        sandboxed=False,
++    ),
++    "recall": ToolSpec(
++        name="recall",
++        func=recall_memory,
++        schema={
++            "type": "object",
++            "properties": {
++                "kind": {
++                    "type": "string",
++                    "enum": ["fact", "assumption", "decision", "task_summary"],
++                },
++                "query": {"type": "string"},
++                "limit": {"type": "integer"},
++            },
++        },
++        risk="read",
++        sandboxed=False,
++    ),
+ }
+ 
+ 
+@@ -365,6 +446,27 @@ Arguments:
+ - content: complete new contents to write
+ - test_command: command to run to verify the change (e.g. a test runner)
+ 
++remember:
++Durably records something about this project so it survives past this
++task, into future sessions. Use "fact" only for something established —
++stated directly by the user, or confirmed by actual tool evidence.
++Use "assumption" for something you are working from but have not
++confirmed. Use "decision" for a choice made about how to proceed and
++why. Never record a guess as a fact.
++Arguments:
++- kind: "fact", "assumption", or "decision"
++- content: the thing to remember, written so it stands alone later
++
++recall:
++Retrieves durable memory recorded about this project in past sessions.
++Use this when you need project context from before this task, or when
++the user refers to something you have no other record of. Omit all
++arguments to get the most recent entries of any kind.
++Arguments (all optional):
++- kind: "fact", "assumption", "decision", or "task_summary"
++- query: text to search for in remembered content
++- limit: maximum number of entries to return (default 10)
++
+ TOOL PROTOCOL:
+ 
+ You may REQUEST tools. You do not execute tools yourself.
+@@ -469,6 +571,25 @@ Another example:
+   }
+ }
+ 
++Another example:
++
++{
++  "tool": "remember",
++  "arguments": {
++    "kind": "decision",
++    "content": "Using SQLite for persistent memory instead of flat JSON files, for queryable history."
++  }
++}
++
++Another example:
++
++{
++  "tool": "recall",
++  "arguments": {
++    "query": "database"
++  }
++}
++
+ Do not invent files.
+ Do not access files outside the workspace.
+ 
+@@ -1088,6 +1209,32 @@ def run_task(prompt, max_steps=20, max_stalls=3):
+     print("\n[Run ID]", run_record.run_id)
+     print("\n[Success Definition]")
+     print(success_definition)
++
++    # Make this run's id available to the remember/recall tools (same
++    # pattern as get_backend()'s module-level cache) so anything
++    # remembered during this task carries proper provenance.
++    global _current_run_id
++    _current_run_id = run_record.run_id
++
++    # Durable project memory from past sessions is injected as its own
++    # labeled context message, never merged into the raw conversation —
++    # this is deliberately NOT a return of the cross-task leak that was
++    # fixed earlier. That leak was the model's own unstructured chat
++    # history bleeding into unrelated tasks. This is a bounded, explicit
++    # set of entries, each tagged with its kind (fact/assumption/
++    # decision) and source, which the model can also fetch on demand
++    # via the recall tool.
++    try:
++        project_id = get_project_id()
++        recalled = memory.recall(project_id, limit=10)
++        context_block = memory.format_context(recalled)
++        if context_block:
++            print("\n[Project Memory]")
++            print(context_block)
++            messages.append({"role": "user", "content": context_block})
++    except Exception as error:
++        print(f"\n[Memory recall unavailable: {error}]")
++
+     messages.append({"role": "user", "content": prompt})
+ 
+     step = 0
+@@ -1179,6 +1326,20 @@ def run_task(prompt, max_steps=20, max_stalls=3):
+     run_path = run_record.save()
+     print(f"\n[Run Record] {run_path}")
+ 
++    # Record what happened as durable project memory — a task_summary
++    # entry, distinct from fact/assumption/decision, so a future task on
++    # this same project can recall what was already attempted without
++    # re-deriving it from scratch. Best-effort: memory unavailability
++    # must never fail an otherwise-completed task.
++    try:
++        memory.remember(
++            get_project_id(), "task_summary",
++            f"Task: {prompt}\nStatus: {run_status}\nAnswer: {answer[:1000]}",
++            source="forge-task", run_id=run_record.run_id,
++        )
++    except Exception as error:
++        print(f"\n[Memory write unavailable: {error}]")
++
+     return {"completion": completion, "evidence": evidence, "answer": answer,
+             "steps": step, "tool_history": tool_history, "run_id": run_record.run_id,
+             "run_record_path": str(run_path)}
+diff --git a/memory.py b/memory.py
+new file mode 100644
+index 0000000..701a78c
+--- /dev/null
++++ b/memory.py
+@@ -0,0 +1,267 @@
++"""
++memory.py — durable, project-scoped memory backed by SQLite.
++
++Phase 02 ("Forge's Brain" / "Everyday agent") starts here. Before this,
++Forge's only state was the in-memory `messages` list, reset at the start
++of every run_task() call (correctly — that fixed a context-leak bug) and
++the `evidence` dict, discarded entirely when the process exits. Nothing
++survived a restart, and nothing distinguished "the user told me this" or
++"Forge concluded this from evidence" from "the user is still deciding" —
++all of that just lived as prose in a conversation that got thrown away.
++
++This module gives Forge a durable record, per project, of:
++
++  - facts        things established as true (from the user or from
++                  verified evidence — never from an unverified guess)
++  - assumptions   things Forge is working from but hasn't confirmed
++  - decisions     choices made about how to proceed, with a reason
++  - task_summary   what happened in a completed run_task() call
++
++Every entry has provenance: who/what said it (`source`) and, when it
++came from a run, which run_id. Memory is never silently overwritten —
++when new evidence contradicts an old entry, the old one is marked
++superseded (kept, not deleted) and a new entry points back at it, so the
++project has an actual decision history, not just a current snapshot.
++
++A project is identified by the resolved path of its workspace, so the
++same workspace always maps to the same project across restarts.
++"""
++
++from __future__ import annotations
++
++import sqlite3
++import time
++from contextlib import contextmanager
++from dataclasses import dataclass
++from pathlib import Path
++from typing import Optional
++
++DB_PATH = Path(__file__).parent / "forge_memory.db"
++
++VALID_KINDS = {"fact", "assumption", "decision", "task_summary"}
++
++SCHEMA = """
++CREATE TABLE IF NOT EXISTS projects (
++    id INTEGER PRIMARY KEY AUTOINCREMENT,
++    workspace_path TEXT UNIQUE NOT NULL,
++    name TEXT,
++    created_at REAL NOT NULL
++);
++
++CREATE TABLE IF NOT EXISTS memory_entries (
++    id INTEGER PRIMARY KEY AUTOINCREMENT,
++    project_id INTEGER NOT NULL REFERENCES projects(id),
++    kind TEXT NOT NULL,
++    content TEXT NOT NULL,
++    source TEXT NOT NULL,
++    run_id TEXT,
++    created_at REAL NOT NULL,
++    active INTEGER NOT NULL DEFAULT 1,
++    superseded_by INTEGER REFERENCES memory_entries(id)
++);
++
++CREATE INDEX IF NOT EXISTS idx_memory_project_kind
++    ON memory_entries(project_id, kind, active);
++"""
++
++
++@dataclass
++class MemoryEntry:
++    id: int
++    project_id: int
++    kind: str
++    content: str
++    source: str
++    run_id: Optional[str]
++    created_at: float
++    active: bool
++    superseded_by: Optional[int]
++
++    @classmethod
++    def from_row(cls, row: sqlite3.Row) -> "MemoryEntry":
++        return cls(
++            id=row["id"],
++            project_id=row["project_id"],
++            kind=row["kind"],
++            content=row["content"],
++            source=row["source"],
++            run_id=row["run_id"],
++            created_at=row["created_at"],
++            active=bool(row["active"]),
++            superseded_by=row["superseded_by"],
++        )
++
++
++def _connect(db_path: Path) -> sqlite3.Connection:
++    conn = sqlite3.connect(db_path)
++    conn.row_factory = sqlite3.Row
++    conn.execute("PRAGMA foreign_keys = ON")
++    return conn
++
++
++@contextmanager
++def _open(db_path: Path):
++    conn = _connect(db_path)
++    try:
++        conn.executescript(SCHEMA)
++        yield conn
++        conn.commit()
++    finally:
++        conn.close()
++
++
++def get_or_create_project(
++    workspace_path: Path, name: Optional[str] = None, db_path: Optional[Path] = None
++) -> int:
++    # db_path deliberately defaults to None, not DB_PATH: a default bound
++    # to DB_PATH's value at function-definition time would freeze that
++    # value forever, so `patch.object(memory, "DB_PATH", ...)` in tests
++    # (and any future runtime override) would silently have no effect on
++    # every call site that relies on the default. Resolving module.DB_PATH
++    # here, at call time, keeps it a live reference.
++    db_path = db_path if db_path is not None else DB_PATH
++    resolved = str(Path(workspace_path).resolve())
++    with _open(db_path) as conn:
++        row = conn.execute(
++            "SELECT id FROM projects WHERE workspace_path = ?", (resolved,)
++        ).fetchone()
++        if row:
++            return row["id"]
++
++        cursor = conn.execute(
++            "INSERT INTO projects (workspace_path, name, created_at) "
++            "VALUES (?, ?, ?)",
++            (resolved, name or Path(resolved).name, time.time()),
++        )
++        return cursor.lastrowid
++
++
++def remember(
++    project_id: int,
++    kind: str,
++    content: str,
++    source: str,
++    run_id: Optional[str] = None,
++    db_path: Optional[Path] = None,
++) -> int:
++    db_path = db_path if db_path is not None else DB_PATH
++    if kind not in VALID_KINDS:
++        raise ValueError(
++            f"Unknown memory kind: {kind!r}. Must be one of {sorted(VALID_KINDS)}."
++        )
++
++    with _open(db_path) as conn:
++        cursor = conn.execute(
++            "INSERT INTO memory_entries "
++            "(project_id, kind, content, source, run_id, created_at, active) "
++            "VALUES (?, ?, ?, ?, ?, ?, 1)",
++            (project_id, kind, content, source, run_id, time.time()),
++        )
++        return cursor.lastrowid
++
++
++def supersede(
++    entry_id: int,
++    new_content: str,
++    source: str,
++    run_id: Optional[str] = None,
++    db_path: Optional[Path] = None,
++) -> int:
++    """Replace an entry because new evidence contradicts it. The old
++    entry is kept (active=0, superseded_by=<new id>) rather than deleted
++    or overwritten in place — the point of a decision history is being
++    able to see that the understanding changed, not just what it is now."""
++    db_path = db_path if db_path is not None else DB_PATH
++    with _open(db_path) as conn:
++        old = conn.execute(
++            "SELECT * FROM memory_entries WHERE id = ?", (entry_id,)
++        ).fetchone()
++        if old is None:
++            raise ValueError(f"No memory entry with id {entry_id}")
++
++        cursor = conn.execute(
++            "INSERT INTO memory_entries "
++            "(project_id, kind, content, source, run_id, created_at, active) "
++            "VALUES (?, ?, ?, ?, ?, ?, 1)",
++            (old["project_id"], old["kind"], new_content, source, run_id, time.time()),
++        )
++        new_id = cursor.lastrowid
++
++        conn.execute(
++            "UPDATE memory_entries SET active = 0, superseded_by = ? WHERE id = ?",
++            (new_id, entry_id),
++        )
++        return new_id
++
++
++def recall(
++    project_id: int,
++    kind: Optional[str] = None,
++    limit: Optional[int] = None,
++    include_superseded: bool = False,
++    db_path: Optional[Path] = None,
++) -> list[MemoryEntry]:
++    db_path = db_path if db_path is not None else DB_PATH
++    query = "SELECT * FROM memory_entries WHERE project_id = ?"
++    params: list = [project_id]
++
++    if not include_superseded:
++        query += " AND active = 1"
++
++    if kind is not None:
++        if kind not in VALID_KINDS:
++            raise ValueError(f"Unknown memory kind: {kind!r}")
++        query += " AND kind = ?"
++        params.append(kind)
++
++    query += " ORDER BY created_at DESC"
++
++    if limit is not None:
++        query += " LIMIT ?"
++        params.append(limit)
++
++    with _open(db_path) as conn:
++        rows = conn.execute(query, params).fetchall()
++        return [MemoryEntry.from_row(row) for row in rows]
++
++
++def search(
++    project_id: int, text: str, db_path: Optional[Path] = None
++) -> list[MemoryEntry]:
++    """Simple substring search over active entries' content — enough for
++    now; a future slice can add FTS if recall quality demands it."""
++    db_path = db_path if db_path is not None else DB_PATH
++    with _open(db_path) as conn:
++        rows = conn.execute(
++            "SELECT * FROM memory_entries "
++            "WHERE project_id = ? AND active = 1 AND content LIKE ? "
++            "ORDER BY created_at DESC",
++            (project_id, f"%{text}%"),
++        ).fetchall()
++        return [MemoryEntry.from_row(row) for row in rows]
++
++
++def history(project_id: int, db_path: Optional[Path] = None) -> list[MemoryEntry]:
++    """Full history for a project, including superseded entries, in the
++    order they were created — the actual decision/fact timeline."""
++    db_path = db_path if db_path is not None else DB_PATH
++    with _open(db_path) as conn:
++        rows = conn.execute(
++            "SELECT * FROM memory_entries WHERE project_id = ? "
++            "ORDER BY created_at ASC",
++            (project_id,),
++        ).fetchall()
++        return [MemoryEntry.from_row(row) for row in rows]
++
++
++def format_context(entries: list[MemoryEntry]) -> str:
++    """Render recalled entries as a block Forge can prepend to a new
++    task's context, with each entry's kind kept visible so facts are
++    never presented with the same confidence as assumptions."""
++    if not entries:
++        return ""
++
++    lines = ["PROJECT MEMORY (from prior sessions):"]
++    for entry in entries:
++        lines.append(f"- [{entry.kind.upper()}] {entry.content} (source: {entry.source})")
++    return "\n".join(lines)
+diff --git a/test_forge.py b/test_forge.py
+index 3acde59..908e9b5 100644
+--- a/test_forge.py
++++ b/test_forge.py
+@@ -198,6 +198,7 @@ class TestForgeIntegration(unittest.TestCase):
+                 with patch.object(forge, "WORKSPACE", workspace), patch.object(
+                     forge, "ask_model", side_effect=lambda: next(responses)
+                 ), patch("run_record.RUNS_DIR", workspace / "_runs"), \
++                        patch("memory.DB_PATH", workspace / "_memory.db"), \
+                         contextlib.redirect_stdout(io.StringIO()):
+                     result = forge.run_task(
+                         "find where hello is used, inspect the relevant files", max_steps=20
+@@ -262,6 +263,14 @@ class TestFoundationsSlice(unittest.TestCase):
+         self.assertNotIn("failed command execution", evidence)
+ 
+     def test_messages_do_not_leak_between_tasks(self):
++        """The bug this guards against: `messages` is a module-level
++        list, and used to accumulate raw conversation across every
++        run_task() call in the same process, so task 2 could see task
++        1's entire exchange verbatim. That must stay fixed regardless of
++        the (separate, intentional) project-memory recall added later:
++        each task's `messages` must start fresh, containing only this
++        task's own prompt text as the ORIGINAL unrelated task's literal
++        prompt — not the first task's full user-supplied sentence."""
+         import contextlib
+         import io
+         from unittest.mock import patch
+@@ -274,6 +283,7 @@ class TestFoundationsSlice(unittest.TestCase):
+                 with patch.object(forge, "WORKSPACE", Path(tmp)), patch.object(
+                     forge, "ask_model", return_value="Noted."
+                 ), patch("run_record.RUNS_DIR", Path(tmp) / "runs"), \
++                        patch("memory.DB_PATH", Path(tmp) / "_memory.db"), \
+                         contextlib.redirect_stdout(io.StringIO()):
+                     forge.run_task(
+                         "remember the secret word banana", max_steps=5, max_stalls=1
+@@ -282,14 +292,120 @@ class TestFoundationsSlice(unittest.TestCase):
+                         "what did I just ask about?", max_steps=5, max_stalls=1
+                     )
+ 
+-            task_contents = [
++            # The second task's raw conversation must not contain the
++            # first task's prompt as a literal message of its own — the
++            # old leak would have appended it verbatim as a prior
++            # "user"-role turn in the same growing list.
++            raw_user_messages = [
+                 m["content"] for m in forge.messages if m["role"] == "user"
+             ]
+             self.assertTrue(
+-                any("what did I just ask" in c for c in task_contents)
++                any("what did I just ask" in c for c in raw_user_messages)
+             )
++            self.assertNotIn(
++                "remember the secret word banana", raw_user_messages
++            )
++        finally:
++            forge.messages[:] = original_messages
++
++    def test_project_memory_does_not_leak_across_different_projects(self):
++        """Two different workspaces are two different projects. A fact
++        remembered while working in one must never surface in the
++        other's recalled context — memory is scoped per project, not
++        global to the process."""
++        import contextlib
++        import io
++        from unittest.mock import patch
++        from pathlib import Path
++        from tempfile import TemporaryDirectory
++
++        responses = iter([
++            '{"tool":"remember","arguments":{"kind":"fact",'
++            '"content":"project A uses PostgreSQL"}}',
++            "Noted.",
++            "Nothing relevant recalled.",
++        ])
++        original_messages = list(forge.messages)
++        try:
++            with TemporaryDirectory() as tmp_a, TemporaryDirectory() as tmp_b:
++                db_path = Path(tmp_a) / "_shared_memory.db"
++                with patch.object(forge, "WORKSPACE", Path(tmp_a)), patch.object(
++                    forge, "ask_model", side_effect=lambda: next(responses)
++                ), patch("run_record.RUNS_DIR", Path(tmp_a) / "runs"), \
++                        patch("memory.DB_PATH", db_path), \
++                        contextlib.redirect_stdout(io.StringIO()):
++                    forge.run_task(
++                        "remember that this project uses PostgreSQL",
++                        max_steps=5, max_stalls=1,
++                    )
++
++                with patch.object(forge, "WORKSPACE", Path(tmp_b)), patch.object(
++                    forge, "ask_model", return_value="Nothing relevant recalled."
++                ), patch("run_record.RUNS_DIR", Path(tmp_b) / "runs"), \
++                        patch("memory.DB_PATH", db_path), \
++                        contextlib.redirect_stdout(io.StringIO()):
++                    forge.run_task(
++                        "what database does this project use?",
++                        max_steps=5, max_stalls=1,
++                    )
++
++            project_b_context = [
++                m["content"] for m in forge.messages
++                if m["role"] == "user" and "PROJECT MEMORY" in m["content"]
++            ]
+             self.assertFalse(
+-                any("secret word banana" in c for c in task_contents)
++                any("PostgreSQL" in c for c in project_b_context)
++            )
++        finally:
++            forge.messages[:] = original_messages
++
++    def test_project_memory_carries_forward_within_same_project(self):
++        """Within the SAME project (same workspace), a fact remembered
++        in one task is deliberately recalled into the next task's
++        context — this is the intended Phase 02 behavior ("we stop
++        starting from zero every session"), labeled explicitly as
++        project memory rather than silently merged into raw chat."""
++        import contextlib
++        import io
++        from unittest.mock import patch
++        from pathlib import Path
++        from tempfile import TemporaryDirectory
++
++        responses = iter([
++            '{"tool":"remember","arguments":{"kind":"fact",'
++            '"content":"the project uses PostgreSQL"}}',
++            "Noted.",
++            "This project uses PostgreSQL.",
++        ])
++        original_messages = list(forge.messages)
++        try:
++            with TemporaryDirectory() as tmp:
++                workspace = Path(tmp)
++                with patch.object(forge, "WORKSPACE", workspace), patch.object(
++                    forge, "ask_model", side_effect=lambda: next(responses)
++                ), patch("run_record.RUNS_DIR", workspace / "runs"), \
++                        patch("memory.DB_PATH", workspace / "_memory.db"), \
++                        contextlib.redirect_stdout(io.StringIO()):
++                    forge.run_task(
++                        "remember that this project uses PostgreSQL",
++                        max_steps=5, max_stalls=1,
++                    )
++                    forge.run_task(
++                        "what database does this project use?",
++                        max_steps=5, max_stalls=1,
++                    )
++
++            project_memory_messages = [
++                m["content"] for m in forge.messages
++                if m["role"] == "user" and "PROJECT MEMORY" in m["content"]
++            ]
++            self.assertTrue(
++                any("PostgreSQL" in c for c in project_memory_messages)
++            )
++            # It must be clearly labeled by kind, not presented as a raw
++            # repeat of the earlier conversation.
++            self.assertTrue(
++                any("[FACT]" in c for c in project_memory_messages)
+             )
+         finally:
+             forge.messages[:] = original_messages
+@@ -309,6 +425,7 @@ class TestFoundationsSlice(unittest.TestCase):
+                 with patch.object(forge, "WORKSPACE", Path(tmp)), patch.object(
+                     forge, "ask_model", return_value="Final answer."
+                 ), patch("run_record.RUNS_DIR", runs_dir), \
++                        patch("memory.DB_PATH", Path(tmp) / "_memory.db"), \
+                         contextlib.redirect_stdout(io.StringIO()):
+                     result = forge.run_task("a trivial task")
+ 
+@@ -340,6 +457,7 @@ class TestFoundationsSlice(unittest.TestCase):
+                 with patch.object(forge, "WORKSPACE", Path(tmp)), patch.object(
+                     forge, "ask_model", side_effect=lambda: next(responses)
+                 ), patch("run_record.RUNS_DIR", Path(tmp) / "runs"), \
++                        patch("memory.DB_PATH", Path(tmp) / "_memory.db"), \
+                         contextlib.redirect_stdout(io.StringIO()):
+                     result = forge.run_task("read missing.py", max_steps=5)
+ 
+@@ -382,6 +500,7 @@ class TestFoundationsSlice(unittest.TestCase):
+                             forge, "ask_model", side_effect=lambda: next(responses)
+                         ), \
+                         patch("run_record.RUNS_DIR", workspace / "_runs"), \
++                        patch("memory.DB_PATH", workspace / "_memory.db"), \
+                         contextlib.redirect_stdout(io.StringIO()):
+                     result = forge.run_task(
+                         "inspect the contents of one.py", max_steps=10
+@@ -428,6 +547,7 @@ class TestFoundationsSlice(unittest.TestCase):
+                 with patch.object(forge, "WORKSPACE", workspace), patch.object(
+                     forge, "ask_model", side_effect=lambda: next(responses)
+                 ), patch("run_record.RUNS_DIR", workspace / "_runs"), \
++                        patch("memory.DB_PATH", workspace / "_memory.db"), \
+                         contextlib.redirect_stdout(io.StringIO()):
+                     result = forge.run_task(
+                         "add a working add() function to calc.py and verify it",
+@@ -473,6 +593,7 @@ class TestFoundationsSlice(unittest.TestCase):
+                 with patch.object(forge, "WORKSPACE", workspace), patch.object(
+                     forge, "ask_model", side_effect=lambda: next(responses)
+                 ), patch("run_record.RUNS_DIR", workspace / "_runs"), \
++                        patch("memory.DB_PATH", workspace / "_memory.db"), \
+                         contextlib.redirect_stdout(io.StringIO()):
+                     result = forge.run_task(
+                         "fix add() in calc.py and verify it", max_steps=5,
+diff --git a/test_memory.py b/test_memory.py
+new file mode 100644
+index 0000000..5b03e4f
+--- /dev/null
++++ b/test_memory.py
+@@ -0,0 +1,178 @@
++import unittest
++from pathlib import Path
++from tempfile import TemporaryDirectory
++
++import memory
++
++
++class TestMemory(unittest.TestCase):
++    def setUp(self):
++        self._tmp = TemporaryDirectory()
++        self.db_path = Path(self._tmp.name) / "test_memory.db"
++
++    def tearDown(self):
++        self._tmp.cleanup()
++
++    def test_same_workspace_maps_to_same_project_across_calls(self):
++        with TemporaryDirectory() as workspace:
++            first = memory.get_or_create_project(Path(workspace), db_path=self.db_path)
++            second = memory.get_or_create_project(Path(workspace), db_path=self.db_path)
++            self.assertEqual(first, second)
++
++    def test_different_workspaces_get_different_projects(self):
++        with TemporaryDirectory() as a, TemporaryDirectory() as b:
++            project_a = memory.get_or_create_project(Path(a), db_path=self.db_path)
++            project_b = memory.get_or_create_project(Path(b), db_path=self.db_path)
++            self.assertNotEqual(project_a, project_b)
++
++    def test_remember_rejects_unknown_kind(self):
++        with TemporaryDirectory() as workspace:
++            project_id = memory.get_or_create_project(Path(workspace), db_path=self.db_path)
++            with self.assertRaises(ValueError):
++                memory.remember(
++                    project_id, "opinion", "forge is cool", source="user",
++                    db_path=self.db_path,
++                )
++
++    def test_recall_returns_only_active_entries_by_default(self):
++        with TemporaryDirectory() as workspace:
++            project_id = memory.get_or_create_project(Path(workspace), db_path=self.db_path)
++            entry_id = memory.remember(
++                project_id, "fact", "uses Python 3.11", source="user",
++                db_path=self.db_path,
++            )
++            memory.supersede(
++                entry_id, "uses Python 3.13", source="user", db_path=self.db_path,
++            )
++
++            active = memory.recall(project_id, db_path=self.db_path)
++            contents = [entry.content for entry in active]
++            self.assertIn("uses Python 3.13", contents)
++            self.assertNotIn("uses Python 3.11", contents)
++
++    def test_supersede_preserves_old_entry_in_history(self):
++        with TemporaryDirectory() as workspace:
++            project_id = memory.get_or_create_project(Path(workspace), db_path=self.db_path)
++            entry_id = memory.remember(
++                project_id, "fact", "uses Python 3.11", source="user",
++                db_path=self.db_path,
++            )
++            new_id = memory.supersede(
++                entry_id, "uses Python 3.13", source="user", db_path=self.db_path,
++            )
++
++            full_history = memory.history(project_id, db_path=self.db_path)
++            contents = {entry.content for entry in full_history}
++            self.assertIn("uses Python 3.11", contents)
++            self.assertIn("uses Python 3.13", contents)
++
++            old_entry = next(e for e in full_history if e.id == entry_id)
++            self.assertFalse(old_entry.active)
++            self.assertEqual(old_entry.superseded_by, new_id)
++
++    def test_recall_filters_by_kind(self):
++        with TemporaryDirectory() as workspace:
++            project_id = memory.get_or_create_project(Path(workspace), db_path=self.db_path)
++            memory.remember(project_id, "fact", "fact one", source="user", db_path=self.db_path)
++            memory.remember(
++                project_id, "assumption", "assumption one", source="forge",
++                db_path=self.db_path,
++            )
++
++            facts = memory.recall(project_id, kind="fact", db_path=self.db_path)
++            self.assertEqual(len(facts), 1)
++            self.assertEqual(facts[0].content, "fact one")
++
++    def test_recall_orders_most_recent_first(self):
++        with TemporaryDirectory() as workspace:
++            project_id = memory.get_or_create_project(Path(workspace), db_path=self.db_path)
++            memory.remember(project_id, "fact", "first", source="user", db_path=self.db_path)
++            memory.remember(project_id, "fact", "second", source="user", db_path=self.db_path)
++
++            entries = memory.recall(project_id, db_path=self.db_path)
++            self.assertEqual(entries[0].content, "second")
++
++    def test_search_matches_substring(self):
++        with TemporaryDirectory() as workspace:
++            project_id = memory.get_or_create_project(Path(workspace), db_path=self.db_path)
++            memory.remember(
++                project_id, "decision", "chose SQLite over Postgres for simplicity",
++                source="forge", db_path=self.db_path,
++            )
++            memory.remember(
++                project_id, "fact", "unrelated entry", source="user", db_path=self.db_path,
++            )
++
++            results = memory.search(project_id, "SQLite", db_path=self.db_path)
++            self.assertEqual(len(results), 1)
++            self.assertIn("SQLite", results[0].content)
++
++    def test_memory_persists_across_separate_connections(self):
++        """The whole point is durability across restarts — simulate that
++        by never holding a connection open between calls (which is how
++        the module already works: _open() opens and closes every time)."""
++        with TemporaryDirectory() as workspace:
++            project_id = memory.get_or_create_project(Path(workspace), db_path=self.db_path)
++            memory.remember(
++                project_id, "fact", "persisted fact", source="user", db_path=self.db_path,
++            )
++
++        # Fresh lookup, same db_path, no shared state except the file on disk.
++        project_id_again = memory.get_or_create_project(Path(workspace), db_path=self.db_path)
++        entries = memory.recall(project_id_again, db_path=self.db_path)
++        self.assertEqual(len(entries), 1)
++        self.assertEqual(entries[0].content, "persisted fact")
++
++    def test_patching_module_db_path_affects_calls_using_the_default(self):
++        """Regression guard: db_path must default to None and resolve
++        memory.DB_PATH inside the function body, never bind to DB_PATH's
++        value directly in the signature. A direct `db_path: Path =
++        DB_PATH` default is captured once at function-definition time,
++        so patch.object(memory, "DB_PATH", ...) in a test — or any
++        runtime override — would silently do nothing for every call
++        that relies on the default, and entries would land in the real
++        forge_memory.db instead of the isolated one. This test calls
++        every public function with NO db_path argument at all, the way
++        forge.py's tool wrappers do, after patching the module
++        attribute, exactly as forge.py's real callers would."""
++        from unittest.mock import patch
++
++        with TemporaryDirectory() as workspace:
++            with patch.object(memory, "DB_PATH", self.db_path):
++                project_id = memory.get_or_create_project(Path(workspace))
++                entry_id = memory.remember(project_id, "fact", "x", source="user")
++                memory.supersede(entry_id, "y", source="user")
++                memory.recall(project_id)
++                memory.search(project_id, "y")
++                memory.history(project_id)
++
++            # Every one of those calls must have landed in self.db_path,
++            # not in the module's real default DB_PATH.
++            self.assertTrue(self.db_path.exists())
++
++        real_default_db = memory.DB_PATH
++        self.assertFalse(
++            real_default_db.exists(),
++            "a call relying on the db_path default wrote to the real "
++            "forge_memory.db instead of the patched path",
++        )
++
++    def test_format_context_labels_each_entry_by_kind(self):
++        with TemporaryDirectory() as workspace:
++            project_id = memory.get_or_create_project(Path(workspace), db_path=self.db_path)
++            memory.remember(project_id, "fact", "a fact", source="user", db_path=self.db_path)
++            memory.remember(
++                project_id, "assumption", "a guess", source="forge", db_path=self.db_path,
++            )
++
++            entries = memory.recall(project_id, db_path=self.db_path)
++            text = memory.format_context(entries)
++            self.assertIn("[FACT] a fact", text)
++            self.assertIn("[ASSUMPTION] a guess", text)
++
++    def test_format_context_empty_for_no_entries(self):
++        self.assertEqual(memory.format_context([]), "")
++
++
++if __name__ == "__main__":
++    unittest.main()
+-- 
+2.43.0

@@ -145,6 +145,32 @@ def recall_memory(kind=None, query=None, limit=10):
         for entry in entries
     ]
 
+
+def recall_runs(query=None, limit=10):
+    """Retrieve the structured run log for this project — not freeform
+    memory text, but the actual completed run_task() calls, each with
+    its final status and step count. Pass `query` to search by text
+    found in the task prompt or final answer (e.g. a filename or
+    feature name); omit it for the most recent runs."""
+    project_id = get_project_id()
+    if query:
+        runs = memory.search_runs(project_id, query)
+    else:
+        runs = memory.list_runs(project_id, limit=limit)
+
+    return [
+        {
+            "run_id": run.run_id,
+            "task": run.task,
+            "final_status": run.final_status,
+            "steps_taken": run.steps_taken,
+            "stalled": run.stalled,
+            "error": run.error,
+            "started_at": run.started_at,
+        }
+        for run in runs
+    ]
+
 def search_files(query):
     matches = []
 
@@ -285,6 +311,19 @@ TOOLS = {
                     "type": "string",
                     "enum": ["fact", "assumption", "decision", "task_summary"],
                 },
+                "query": {"type": "string"},
+                "limit": {"type": "integer"},
+            },
+        },
+        risk="read",
+        sandboxed=False,
+    ),
+    "recall_runs": ToolSpec(
+        name="recall_runs",
+        func=recall_runs,
+        schema={
+            "type": "object",
+            "properties": {
                 "query": {"type": "string"},
                 "limit": {"type": "integer"},
             },
@@ -467,6 +506,16 @@ Arguments (all optional):
 - query: text to search for in remembered content
 - limit: maximum number of entries to return (default 10)
 
+recall_runs:
+Retrieves the structured log of completed tasks on this project — each
+entry's actual final status and step count, not freeform memory text.
+Use this to check whether something was already attempted (and whether
+it succeeded) before redoing the work, or when the user asks what
+happened in a past run. Omit query for the most recent runs.
+Arguments (all optional):
+- query: text to search for in the task prompt or final answer
+- limit: maximum number of runs to return (default 10)
+
 TOOL PROTOCOL:
 
 You may REQUEST tools. You do not execute tools yourself.
@@ -587,6 +636,15 @@ Another example:
   "tool": "recall",
   "arguments": {
     "query": "database"
+  }
+}
+
+Another example:
+
+{
+  "tool": "recall_runs",
+  "arguments": {
+    "query": "auth"
   }
 }
 
@@ -1339,6 +1397,17 @@ def run_task(prompt, max_steps=20, max_stalls=3):
         )
     except Exception as error:
         print(f"\n[Memory write unavailable: {error}]")
+
+    # Also persist the FULL structured run (every tool call, not just a
+    # text summary) into the queryable runs table. The JSON file written
+    # above by run_record.save() stays as the human/debug copy; this is
+    # what makes "show me the runs where I touched auth.py" or "how many
+    # of the last 10 runs failed" an actual query instead of grepping
+    # files by hand. Best-effort for the same reason as above.
+    try:
+        memory.save_run(get_project_id(), run_record.to_dict())
+    except Exception as error:
+        print(f"\n[Run-log write unavailable: {error}]")
 
     return {"completion": completion, "evidence": evidence, "answer": answer,
             "steps": step, "tool_history": tool_history, "run_id": run_record.run_id,

@@ -410,6 +410,101 @@ class TestFoundationsSlice(unittest.TestCase):
         finally:
             forge.messages[:] = original_messages
 
+    def test_run_task_saves_structured_run_log_automatically(self):
+        """Every completed run_task() call must land in the queryable
+        runs table (memory.save_run), not just the per-run JSON file —
+        this is what makes recall_runs useful without any extra step."""
+        import contextlib
+        import io
+        from unittest.mock import patch
+        from pathlib import Path
+        from tempfile import TemporaryDirectory
+
+        import memory as memory_module
+
+        original_messages = list(forge.messages)
+        try:
+            with TemporaryDirectory() as tmp:
+                workspace = Path(tmp)
+                db_path = workspace / "_memory.db"
+                with patch.object(forge, "WORKSPACE", workspace), patch.object(
+                    forge, "ask_model", return_value="Final answer."
+                ), patch("run_record.RUNS_DIR", workspace / "_runs"), \
+                        patch("memory.DB_PATH", db_path), \
+                        contextlib.redirect_stdout(io.StringIO()):
+                    result = forge.run_task("a trivial task", max_steps=5, max_stalls=1)
+
+                project_id = memory_module.get_or_create_project(
+                    workspace, db_path=db_path
+                )
+                runs = memory_module.list_runs(project_id, db_path=db_path)
+                self.assertEqual(len(runs), 1)
+                self.assertEqual(runs[0].run_id, result["run_id"])
+                self.assertEqual(runs[0].task, "a trivial task")
+
+                full_run = memory_module.get_run(result["run_id"], db_path=db_path)
+                self.assertIsNotNone(full_run)
+                self.assertIsInstance(full_run["tool_calls"], list)
+        finally:
+            forge.messages[:] = original_messages
+
+    def test_recall_runs_tool_finds_prior_run_end_to_end(self):
+        """The model can use recall_runs mid-task to check whether a
+        prior run already touched something, via the real tool-call
+        pipeline (not calling memory.search_runs directly)."""
+        import contextlib
+        import io
+        from unittest.mock import patch
+        from pathlib import Path
+        from tempfile import TemporaryDirectory
+
+        original_messages = list(forge.messages)
+        try:
+            with TemporaryDirectory() as tmp:
+                workspace = Path(tmp)
+                db_path = workspace / "_memory.db"
+
+                with patch.object(forge, "WORKSPACE", workspace), patch.object(
+                    forge, "ask_model", return_value="Done fixing the auth bug."
+                ), patch("run_record.RUNS_DIR", workspace / "_runs"), \
+                        patch("memory.DB_PATH", db_path), \
+                        contextlib.redirect_stdout(io.StringIO()):
+                    forge.run_task("fix the auth bug", max_steps=5, max_stalls=1)
+
+                responses = iter([
+                    '{"tool":"recall_runs","arguments":{"query":"auth"}}',
+                    "Found a prior run about the auth bug.",
+                ])
+                with patch.object(forge, "WORKSPACE", workspace), patch.object(
+                    forge, "ask_model", side_effect=lambda: next(responses)
+                ), patch("run_record.RUNS_DIR", workspace / "_runs"), \
+                        patch("memory.DB_PATH", db_path), \
+                        contextlib.redirect_stdout(io.StringIO()):
+                    result = forge.run_task(
+                        "did we already work on auth?", max_steps=5, max_stalls=1,
+                    )
+
+                recall_calls = [
+                    call for call in result["tool_history"]
+                    if call[0] == "recall_runs"
+                ]
+                self.assertEqual(len(recall_calls), 1)
+
+                # The tool actually returned the prior run's data back
+                # into the conversation (this prompt isn't a recognized
+                # request type for the completion heuristics, so the
+                # polished final answer gets a grounded-but-generic
+                # fallback — what matters here is that recall_runs found
+                # the right run, not how the final answer was phrased).
+                tool_result_messages = [
+                    m["content"] for m in forge.messages if m["role"] == "user"
+                ]
+                self.assertTrue(
+                    any("fix the auth bug" in c for c in tool_result_messages)
+                )
+        finally:
+            forge.messages[:] = original_messages
+
     def test_run_task_writes_a_durable_run_record(self):
         import contextlib
         import io

@@ -1,0 +1,608 @@
+From 09841a6282f42fb357aacd2b9c330f5d333de666 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Tue, 10 Nov 2026 20:17:12 +0000
+Subject: [PATCH] Structured, queryable task log (SQLite runs table)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Extends the Phase 02 memory layer: run_record.py already wrote a full
+per-task record (ordered tool calls, completion check, final status)
+to a JSON file for human/debug reading — that stays as-is. What was
+missing was being able to ask anything about run history across a
+project without opening files one at a time: "how many of the last 10
+runs failed", "did we already work on auth.py".
+
+memory.py:
+- New `runs` table (run_id PK, project_id FK, task, model, timestamps,
+  final_status, final_answer, steps_taken, stalled, error, and the
+  full tool_calls list as a JSON column), indexed on (project_id,
+  started_at).
+- save_run(project_id, run_dict): INSERT OR REPLACE keyed on run_id,
+  so a run saved once on error and again at natural completion updates
+  the same row rather than duplicating.
+- get_run(run_id): full run including tool_calls, as a plain dict.
+- list_runs(project_id, limit=20): cheap most-recent-first summaries
+  (RunSummary dataclass) without the tool_calls payload.
+- search_runs(project_id, text): matches against task or final_answer
+  text, scoped to the project.
+
+forge.py:
+- run_task() calls memory.save_run() alongside the existing JSON
+  write, best-effort (never fails an otherwise-completed task).
+- New `recall_runs` tool (query, limit) so the model itself can check
+  whether something was already attempted, and whether it succeeded,
+  before redoing work — distinct from the existing `recall` tool,
+  which is freeform fact/assumption/decision/task_summary text, not
+  the structured run log.
+- System prompt documents the new tool with a JSON example.
+
+test_memory.py (10 new tests, TestRunStorage): round-trip of
+tool_calls through save/get, idempotency on run_id, ordering, limit,
+project scoping, substring search over task and final_answer text, and
+that the stalled flag survives as an actual bool.
+
+test_forge.py (2 new end-to-end tests): a completed run_task() call is
+proven to land in the queryable runs table automatically (not just the
+JSON file), and the recall_runs tool is driven through the real
+tool-call pipeline to find a prior run by content, with the assertion
+checking the actual tool result delivered back into the conversation
+rather than the polished final answer (which the existing, correct
+"don't auto-verify unrecognized request types" heuristic leaves
+generic for a query type outside its known categories).
+
+72/72 tests pass (60 prior + 12 new).
+
+Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01Nf1Av26L3kPBokvvZ1kN29
+---
+ forge.py       |  69 +++++++++++++++++++++++
+ memory.py      | 145 +++++++++++++++++++++++++++++++++++++++++++++++++
+ test_forge.py  |  95 ++++++++++++++++++++++++++++++++
+ test_memory.py | 144 ++++++++++++++++++++++++++++++++++++++++++++++++
+ 4 files changed, 453 insertions(+)
+
+diff --git a/forge.py b/forge.py
+index c23bac5..7d3967b 100644
+--- a/forge.py
++++ b/forge.py
+@@ -145,6 +145,32 @@ def recall_memory(kind=None, query=None, limit=10):
+         for entry in entries
+     ]
+
++
++def recall_runs(query=None, limit=10):
++    """Retrieve the structured run log for this project — not freeform
++    memory text, but the actual completed run_task() calls, each with
++    its final status and step count. Pass `query` to search by text
++    found in the task prompt or final answer (e.g. a filename or
++    feature name); omit it for the most recent runs."""
++    project_id = get_project_id()
++    if query:
++        runs = memory.search_runs(project_id, query)
++    else:
++        runs = memory.list_runs(project_id, limit=limit)
++
++    return [
++        {
++            "run_id": run.run_id,
++            "task": run.task,
++            "final_status": run.final_status,
++            "steps_taken": run.steps_taken,
++            "stalled": run.stalled,
++            "error": run.error,
++            "started_at": run.started_at,
++        }
++        for run in runs
++    ]
++
+ def search_files(query):
+     matches = []
+
+@@ -292,6 +318,19 @@ TOOLS = {
+         risk="read",
+         sandboxed=False,
+     ),
++    "recall_runs": ToolSpec(
++        name="recall_runs",
++        func=recall_runs,
++        schema={
++            "type": "object",
++            "properties": {
++                "query": {"type": "string"},
++                "limit": {"type": "integer"},
++            },
++        },
++        risk="read",
++        sandboxed=False,
++    ),
+ }
+
+
+@@ -467,6 +506,16 @@ Arguments (all optional):
+ - query: text to search for in remembered content
+ - limit: maximum number of entries to return (default 10)
+
++recall_runs:
++Retrieves the structured log of completed tasks on this project — each
++entry's actual final status and step count, not freeform memory text.
++Use this to check whether something was already attempted (and whether
++it succeeded) before redoing the work, or when the user asks what
++happened in a past run. Omit query for the most recent runs.
++Arguments (all optional):
++- query: text to search for in the task prompt or final answer
++- limit: maximum number of runs to return (default 10)
++
+ TOOL PROTOCOL:
+
+ You may REQUEST tools. You do not execute tools yourself.
+@@ -590,6 +639,15 @@ Another example:
+   }
+ }
+
++Another example:
++
++{
++  "tool": "recall_runs",
++  "arguments": {
++    "query": "auth"
++  }
++}
++
+ Do not invent files.
+ Do not access files outside the workspace.
+
+@@ -1340,6 +1398,17 @@ def run_task(prompt, max_steps=20, max_stalls=3):
+     except Exception as error:
+         print(f"\n[Memory write unavailable: {error}]")
+
++    # Also persist the FULL structured run (every tool call, not just a
++    # text summary) into the queryable runs table. The JSON file written
++    # above by run_record.save() stays as the human/debug copy; this is
++    # what makes "show me the runs where I touched auth.py" or "how many
++    # of the last 10 runs failed" an actual query instead of grepping
++    # files by hand. Best-effort for the same reason as above.
++    try:
++        memory.save_run(get_project_id(), run_record.to_dict())
++    except Exception as error:
++        print(f"\n[Run-log write unavailable: {error}]")
++
+     return {"completion": completion, "evidence": evidence, "answer": answer,
+             "steps": step, "tool_history": tool_history, "run_id": run_record.run_id,
+             "run_record_path": str(run_path)}
+diff --git a/memory.py b/memory.py
+index 701a78c..acff874 100644
+--- a/memory.py
++++ b/memory.py
+@@ -25,10 +25,19 @@ project has an actual decision history, not just a current snapshot.
+
+ A project is identified by the resolved path of its workspace, so the
+ same workspace always maps to the same project across restarts.
++
++It also holds the structured, queryable task log: every run_task() call
++in full (its ordered tool calls, completion check, final status), keyed
++by project. run_record.py already wrote this to a per-run JSON file for
++human/debug reading (RUNS_DIR) — that stays as-is. What's new here is
++making run history actually queryable: "how many of my last 20 runs on
++this project failed", "show me what happened in the run where I fixed
++the auth bug", without opening files one at a time.
+ """
+
+ from __future__ import annotations
+
++import json
+ import sqlite3
+ import time
+ from contextlib import contextmanager
+@@ -62,6 +71,24 @@ CREATE TABLE IF NOT EXISTS memory_entries (
+
+ CREATE INDEX IF NOT EXISTS idx_memory_project_kind
+     ON memory_entries(project_id, kind, active);
++
++CREATE TABLE IF NOT EXISTS runs (
++    run_id TEXT PRIMARY KEY,
++    project_id INTEGER NOT NULL REFERENCES projects(id),
++    task TEXT NOT NULL,
++    model TEXT,
++    started_at REAL NOT NULL,
++    ended_at REAL,
++    final_status TEXT,
++    final_answer TEXT,
++    steps_taken INTEGER,
++    stalled INTEGER NOT NULL DEFAULT 0,
++    error TEXT,
++    tool_calls_json TEXT NOT NULL DEFAULT '[]'
++);
++
++CREATE INDEX IF NOT EXISTS idx_runs_project_started
++    ON runs(project_id, started_at);
+ """
+
+
+@@ -254,6 +281,124 @@ def history(project_id: int, db_path: Optional[Path] = None) -> list[MemoryEntry
+         return [MemoryEntry.from_row(row) for row in rows]
+
+
++@dataclass
++class RunSummary:
++    """A run without its tool_calls payload — cheap to list many of."""
++    run_id: str
++    project_id: int
++    task: str
++    model: Optional[str]
++    started_at: float
++    ended_at: Optional[float]
++    final_status: Optional[str]
++    final_answer: Optional[str]
++    steps_taken: Optional[int]
++    stalled: bool
++    error: Optional[str]
++
++    @classmethod
++    def from_row(cls, row: sqlite3.Row) -> "RunSummary":
++        return cls(
++            run_id=row["run_id"],
++            project_id=row["project_id"],
++            task=row["task"],
++            model=row["model"],
++            started_at=row["started_at"],
++            ended_at=row["ended_at"],
++            final_status=row["final_status"],
++            final_answer=row["final_answer"],
++            steps_taken=row["steps_taken"],
++            stalled=bool(row["stalled"]),
++            error=row["error"],
++        )
++
++
++def save_run(
++    project_id: int, run_dict: dict, db_path: Optional[Path] = None
++) -> None:
++    """Persist a run_record.RunRecord.to_dict() as a queryable row.
++    Idempotent on run_id (REPLACE) so saving the same run twice — e.g.
++    once on error, once at natural completion — just updates it rather
++    than duplicating or failing."""
++    db_path = db_path if db_path is not None else DB_PATH
++    with _open(db_path) as conn:
++        conn.execute(
++            "INSERT OR REPLACE INTO runs "
++            "(run_id, project_id, task, model, started_at, ended_at, "
++            " final_status, final_answer, steps_taken, stalled, error, "
++            " tool_calls_json) "
++            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
++            (
++                run_dict["run_id"],
++                project_id,
++                run_dict.get("task"),
++                run_dict.get("model"),
++                run_dict.get("started_at"),
++                run_dict.get("ended_at"),
++                run_dict.get("final_status"),
++                run_dict.get("final_answer"),
++                run_dict.get("steps_taken"),
++                int(bool(run_dict.get("stalled"))),
++                run_dict.get("error"),
++                json.dumps(run_dict.get("tool_calls", []), default=str),
++            ),
++        )
++
++
++def get_run(run_id: str, db_path: Optional[Path] = None) -> Optional[dict]:
++    """Full run, including its tool call history, as a plain dict."""
++    db_path = db_path if db_path is not None else DB_PATH
++    with _open(db_path) as conn:
++        row = conn.execute(
++            "SELECT * FROM runs WHERE run_id = ?", (run_id,)
++        ).fetchone()
++        if row is None:
++            return None
++
++        data = dict(row)
++        data["stalled"] = bool(data["stalled"])
++        data["tool_calls"] = json.loads(data.pop("tool_calls_json"))
++        return data
++
++
++def list_runs(
++    project_id: int, limit: Optional[int] = 20, db_path: Optional[Path] = None
++) -> list[RunSummary]:
++    """Most-recent-first run summaries for a project, without the
++    (potentially large) tool_calls payload — cheap enough to list."""
++    db_path = db_path if db_path is not None else DB_PATH
++    query = (
++        "SELECT run_id, project_id, task, model, started_at, ended_at, "
++        "final_status, final_answer, steps_taken, stalled, error "
++        "FROM runs WHERE project_id = ? ORDER BY started_at DESC"
++    )
++    params: list = [project_id]
++    if limit is not None:
++        query += " LIMIT ?"
++        params.append(limit)
++
++    with _open(db_path) as conn:
++        rows = conn.execute(query, params).fetchall()
++        return [RunSummary.from_row(row) for row in rows]
++
++
++def search_runs(
++    project_id: int, text: str, db_path: Optional[Path] = None
++) -> list[RunSummary]:
++    """Runs for this project whose task or final answer mentions `text`."""
++    db_path = db_path if db_path is not None else DB_PATH
++    with _open(db_path) as conn:
++        rows = conn.execute(
++            "SELECT run_id, project_id, task, model, started_at, ended_at, "
++            "final_status, final_answer, steps_taken, stalled, error "
++            "FROM runs WHERE project_id = ? "
++            "AND (task LIKE ? OR final_answer LIKE ?) "
++            "ORDER BY started_at DESC",
++            (project_id, f"%{text}%", f"%{text}%"),
++        ).fetchall()
++        return [RunSummary.from_row(row) for row in rows]
++
++
+ def format_context(entries: list[MemoryEntry]) -> str:
+     """Render recalled entries as a block Forge can prepend to a new
+     task's context, with each entry's kind kept visible so facts are
+diff --git a/test_forge.py b/test_forge.py
+index 908e9b5..f974a98 100644
+--- a/test_forge.py
++++ b/test_forge.py
+@@ -410,6 +410,101 @@ class TestFoundationsSlice(unittest.TestCase):
+         finally:
+             forge.messages[:] = original_messages
+
++    def test_run_task_saves_structured_run_log_automatically(self):
++        """Every completed run_task() call must land in the queryable
++        runs table (memory.save_run), not just the per-run JSON file —
++        this is what makes recall_runs useful without any extra step."""
++        import contextlib
++        import io
++        from unittest.mock import patch
++        from pathlib import Path
++        from tempfile import TemporaryDirectory
++
++        import memory as memory_module
++
++        original_messages = list(forge.messages)
++        try:
++            with TemporaryDirectory() as tmp:
++                workspace = Path(tmp)
++                db_path = workspace / "_memory.db"
++                with patch.object(forge, "WORKSPACE", workspace), patch.object(
++                    forge, "ask_model", return_value="Final answer."
++                ), patch("run_record.RUNS_DIR", workspace / "_runs"), \
++                        patch("memory.DB_PATH", db_path), \
++                        contextlib.redirect_stdout(io.StringIO()):
++                    result = forge.run_task("a trivial task", max_steps=5, max_stalls=1)
++
++                project_id = memory_module.get_or_create_project(
++                    workspace, db_path=db_path
++                )
++                runs = memory_module.list_runs(project_id, db_path=db_path)
++                self.assertEqual(len(runs), 1)
++                self.assertEqual(runs[0].run_id, result["run_id"])
++                self.assertEqual(runs[0].task, "a trivial task")
++
++                full_run = memory_module.get_run(result["run_id"], db_path=db_path)
++                self.assertIsNotNone(full_run)
++                self.assertIsInstance(full_run["tool_calls"], list)
++        finally:
++            forge.messages[:] = original_messages
++
++    def test_recall_runs_tool_finds_prior_run_end_to_end(self):
++        """The model can use recall_runs mid-task to check whether a
++        prior run already touched something, via the real tool-call
++        pipeline (not calling memory.search_runs directly)."""
++        import contextlib
++        import io
++        from unittest.mock import patch
++        from pathlib import Path
++        from tempfile import TemporaryDirectory
++
++        original_messages = list(forge.messages)
++        try:
++            with TemporaryDirectory() as tmp:
++                workspace = Path(tmp)
++                db_path = workspace / "_memory.db"
++
++                with patch.object(forge, "WORKSPACE", workspace), patch.object(
++                    forge, "ask_model", return_value="Done fixing the auth bug."
++                ), patch("run_record.RUNS_DIR", workspace / "_runs"), \
++                        patch("memory.DB_PATH", db_path), \
++                        contextlib.redirect_stdout(io.StringIO()):
++                    forge.run_task("fix the auth bug", max_steps=5, max_stalls=1)
++
++                responses = iter([
++                    '{"tool":"recall_runs","arguments":{"query":"auth"}}',
++                    "Found a prior run about the auth bug.",
++                ])
++                with patch.object(forge, "WORKSPACE", workspace), patch.object(
++                    forge, "ask_model", side_effect=lambda: next(responses)
++                ), patch("run_record.RUNS_DIR", workspace / "_runs"), \
++                        patch("memory.DB_PATH", db_path), \
++                        contextlib.redirect_stdout(io.StringIO()):
++                    result = forge.run_task(
++                        "did we already work on auth?", max_steps=5, max_stalls=1,
++                    )
++
++                recall_calls = [
++                    call for call in result["tool_history"]
++                    if call[0] == "recall_runs"
++                ]
++                self.assertEqual(len(recall_calls), 1)
++
++                # The tool actually returned the prior run's data back
++                # into the conversation (this prompt isn't a recognized
++                # request type for the completion heuristics, so the
++                # polished final answer gets a grounded-but-generic
++                # fallback — what matters here is that recall_runs found
++                # the right run, not how the final answer was phrased).
++                tool_result_messages = [
++                    m["content"] for m in forge.messages if m["role"] == "user"
++                ]
++                self.assertTrue(
++                    any("fix the auth bug" in c for c in tool_result_messages)
++                )
++        finally:
++            forge.messages[:] = original_messages
++
+     def test_run_task_writes_a_durable_run_record(self):
+         import contextlib
+         import io
+diff --git a/test_memory.py b/test_memory.py
+index 5b03e4f..c9f2613 100644
+--- a/test_memory.py
++++ b/test_memory.py
+@@ -174,5 +174,149 @@ class TestMemory(unittest.TestCase):
+         self.assertEqual(memory.format_context([]), "")
+
+
++class TestRunStorage(unittest.TestCase):
++    """Structured, queryable task log — extends the SQLite layer so run
++    history (what run_record.py already captures per-task) can be
++    queried across a project's runs, not just read one JSON file at a
++    time."""
++
++    def setUp(self):
++        self._tmp = TemporaryDirectory()
++        self.db_path = Path(self._tmp.name) / "test_runs.db"
++        self._workspace = TemporaryDirectory()
++        self.project_id = memory.get_or_create_project(
++            Path(self._workspace.name), db_path=self.db_path
++        )
++
++    def tearDown(self):
++        self._tmp.cleanup()
++        self._workspace.cleanup()
++
++    def _run_dict(self, run_id="run-1", task="do the thing", final_status="complete",
++                   final_answer="did the thing", steps_taken=3, stalled=False,
++                   error=None, tool_calls=None):
++        return {
++            "run_id": run_id,
++            "task": task,
++            "model": "qwen2.5-coder:3b",
++            "started_at": 1000.0,
++            "ended_at": 1010.0,
++            "final_status": final_status,
++            "final_answer": final_answer,
++            "steps_taken": steps_taken,
++            "stalled": stalled,
++            "error": error,
++            "tool_calls": tool_calls or [
++                {"step": 1, "tool": "read_file", "status": "success"},
++            ],
++        }
++
++    def test_save_and_get_run_round_trips_tool_calls(self):
++        memory.save_run(self.project_id, self._run_dict(), db_path=self.db_path)
++        run = memory.get_run("run-1", db_path=self.db_path)
++        self.assertIsNotNone(run)
++        self.assertEqual(run["task"], "do the thing")
++        self.assertEqual(len(run["tool_calls"]), 1)
++        self.assertEqual(run["tool_calls"][0]["tool"], "read_file")
++
++    def test_get_run_returns_none_for_unknown_id(self):
++        self.assertIsNone(memory.get_run("no-such-run", db_path=self.db_path))
++
++    def test_save_run_is_idempotent_on_run_id(self):
++        """A run saved once on error and again at natural completion
++        must update the same row, not create a duplicate."""
++        memory.save_run(
++            self.project_id,
++            self._run_dict(final_status="error", final_answer=None),
++            db_path=self.db_path,
++        )
++        memory.save_run(
++            self.project_id,
++            self._run_dict(final_status="complete", final_answer="done"),
++            db_path=self.db_path,
++        )
++
++        runs = memory.list_runs(self.project_id, db_path=self.db_path)
++        self.assertEqual(len(runs), 1)
++        self.assertEqual(runs[0].final_status, "complete")
++
++    def test_list_runs_orders_most_recent_first(self):
++        memory.save_run(
++            self.project_id,
++            self._run_dict(run_id="run-old", task="first"),
++            db_path=self.db_path,
++        )
++        newer = self._run_dict(run_id="run-new", task="second")
++        newer["started_at"] = 2000.0
++        memory.save_run(self.project_id, newer, db_path=self.db_path)
++
++        runs = memory.list_runs(self.project_id, db_path=self.db_path)
++        self.assertEqual(runs[0].run_id, "run-new")
++        self.assertEqual(runs[1].run_id, "run-old")
++
++    def test_list_runs_does_not_include_tool_calls(self):
++        """Listing must stay cheap — no tool_calls payload on a summary."""
++        memory.save_run(self.project_id, self._run_dict(), db_path=self.db_path)
++        runs = memory.list_runs(self.project_id, db_path=self.db_path)
++        self.assertFalse(hasattr(runs[0], "tool_calls"))
++
++    def test_list_runs_respects_limit(self):
++        for i in range(5):
++            run = self._run_dict(run_id=f"run-{i}", task=f"task {i}")
++            run["started_at"] = float(i)
++            memory.save_run(self.project_id, run, db_path=self.db_path)
++
++        runs = memory.list_runs(self.project_id, limit=2, db_path=self.db_path)
++        self.assertEqual(len(runs), 2)
++
++    def test_search_runs_matches_task_text(self):
++        memory.save_run(
++            self.project_id, self._run_dict(run_id="r1", task="fix the auth bug"),
++            db_path=self.db_path,
++        )
++        memory.save_run(
++            self.project_id, self._run_dict(run_id="r2", task="add a new endpoint"),
++            db_path=self.db_path,
++        )
++
++        results = memory.search_runs(self.project_id, "auth", db_path=self.db_path)
++        self.assertEqual(len(results), 1)
++        self.assertEqual(results[0].run_id, "r1")
++
++    def test_search_runs_matches_final_answer_text(self):
++        memory.save_run(
++            self.project_id,
++            self._run_dict(
++                run_id="r1", task="unrelated task",
++                final_answer="rolled back the broken edit to calc.py",
++            ),
++            db_path=self.db_path,
++        )
++        results = memory.search_runs(self.project_id, "calc.py", db_path=self.db_path)
++        self.assertEqual(len(results), 1)
++
++    def test_runs_scoped_per_project(self):
++        with TemporaryDirectory() as other_workspace:
++            other_project_id = memory.get_or_create_project(
++                Path(other_workspace), db_path=self.db_path
++            )
++            memory.save_run(
++                self.project_id, self._run_dict(run_id="mine"), db_path=self.db_path,
++            )
++            memory.save_run(
++                other_project_id, self._run_dict(run_id="theirs"), db_path=self.db_path,
++            )
++
++            mine = memory.list_runs(self.project_id, db_path=self.db_path)
++            self.assertEqual([r.run_id for r in mine], ["mine"])
++
++    def test_stalled_flag_round_trips_as_bool(self):
++        memory.save_run(
++            self.project_id, self._run_dict(stalled=True), db_path=self.db_path,
++        )
++        run = memory.get_run("run-1", db_path=self.db_path)
++        self.assertIs(run["stalled"], True)
++
++
+ if __name__ == "__main__":
+     unittest.main()
+--
+2.43.0

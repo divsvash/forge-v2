@@ -174,5 +174,149 @@ class TestMemory(unittest.TestCase):
         self.assertEqual(memory.format_context([]), "")
 
 
+class TestRunStorage(unittest.TestCase):
+    """Structured, queryable task log — extends the SQLite layer so run
+    history (what run_record.py already captures per-task) can be
+    queried across a project's runs, not just read one JSON file at a
+    time."""
+
+    def setUp(self):
+        self._tmp = TemporaryDirectory()
+        self.db_path = Path(self._tmp.name) / "test_runs.db"
+        self._workspace = TemporaryDirectory()
+        self.project_id = memory.get_or_create_project(
+            Path(self._workspace.name), db_path=self.db_path
+        )
+
+    def tearDown(self):
+        self._tmp.cleanup()
+        self._workspace.cleanup()
+
+    def _run_dict(self, run_id="run-1", task="do the thing", final_status="complete",
+                   final_answer="did the thing", steps_taken=3, stalled=False,
+                   error=None, tool_calls=None):
+        return {
+            "run_id": run_id,
+            "task": task,
+            "model": "qwen2.5-coder:3b",
+            "started_at": 1000.0,
+            "ended_at": 1010.0,
+            "final_status": final_status,
+            "final_answer": final_answer,
+            "steps_taken": steps_taken,
+            "stalled": stalled,
+            "error": error,
+            "tool_calls": tool_calls or [
+                {"step": 1, "tool": "read_file", "status": "success"},
+            ],
+        }
+
+    def test_save_and_get_run_round_trips_tool_calls(self):
+        memory.save_run(self.project_id, self._run_dict(), db_path=self.db_path)
+        run = memory.get_run("run-1", db_path=self.db_path)
+        self.assertIsNotNone(run)
+        self.assertEqual(run["task"], "do the thing")
+        self.assertEqual(len(run["tool_calls"]), 1)
+        self.assertEqual(run["tool_calls"][0]["tool"], "read_file")
+
+    def test_get_run_returns_none_for_unknown_id(self):
+        self.assertIsNone(memory.get_run("no-such-run", db_path=self.db_path))
+
+    def test_save_run_is_idempotent_on_run_id(self):
+        """A run saved once on error and again at natural completion
+        must update the same row, not create a duplicate."""
+        memory.save_run(
+            self.project_id,
+            self._run_dict(final_status="error", final_answer=None),
+            db_path=self.db_path,
+        )
+        memory.save_run(
+            self.project_id,
+            self._run_dict(final_status="complete", final_answer="done"),
+            db_path=self.db_path,
+        )
+
+        runs = memory.list_runs(self.project_id, db_path=self.db_path)
+        self.assertEqual(len(runs), 1)
+        self.assertEqual(runs[0].final_status, "complete")
+
+    def test_list_runs_orders_most_recent_first(self):
+        memory.save_run(
+            self.project_id,
+            self._run_dict(run_id="run-old", task="first"),
+            db_path=self.db_path,
+        )
+        newer = self._run_dict(run_id="run-new", task="second")
+        newer["started_at"] = 2000.0
+        memory.save_run(self.project_id, newer, db_path=self.db_path)
+
+        runs = memory.list_runs(self.project_id, db_path=self.db_path)
+        self.assertEqual(runs[0].run_id, "run-new")
+        self.assertEqual(runs[1].run_id, "run-old")
+
+    def test_list_runs_does_not_include_tool_calls(self):
+        """Listing must stay cheap — no tool_calls payload on a summary."""
+        memory.save_run(self.project_id, self._run_dict(), db_path=self.db_path)
+        runs = memory.list_runs(self.project_id, db_path=self.db_path)
+        self.assertFalse(hasattr(runs[0], "tool_calls"))
+
+    def test_list_runs_respects_limit(self):
+        for i in range(5):
+            run = self._run_dict(run_id=f"run-{i}", task=f"task {i}")
+            run["started_at"] = float(i)
+            memory.save_run(self.project_id, run, db_path=self.db_path)
+
+        runs = memory.list_runs(self.project_id, limit=2, db_path=self.db_path)
+        self.assertEqual(len(runs), 2)
+
+    def test_search_runs_matches_task_text(self):
+        memory.save_run(
+            self.project_id, self._run_dict(run_id="r1", task="fix the auth bug"),
+            db_path=self.db_path,
+        )
+        memory.save_run(
+            self.project_id, self._run_dict(run_id="r2", task="add a new endpoint"),
+            db_path=self.db_path,
+        )
+
+        results = memory.search_runs(self.project_id, "auth", db_path=self.db_path)
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0].run_id, "r1")
+
+    def test_search_runs_matches_final_answer_text(self):
+        memory.save_run(
+            self.project_id,
+            self._run_dict(
+                run_id="r1", task="unrelated task",
+                final_answer="rolled back the broken edit to calc.py",
+            ),
+            db_path=self.db_path,
+        )
+        results = memory.search_runs(self.project_id, "calc.py", db_path=self.db_path)
+        self.assertEqual(len(results), 1)
+
+    def test_runs_scoped_per_project(self):
+        with TemporaryDirectory() as other_workspace:
+            other_project_id = memory.get_or_create_project(
+                Path(other_workspace), db_path=self.db_path
+            )
+            memory.save_run(
+                self.project_id, self._run_dict(run_id="mine"), db_path=self.db_path,
+            )
+            memory.save_run(
+                other_project_id, self._run_dict(run_id="theirs"), db_path=self.db_path,
+            )
+
+            mine = memory.list_runs(self.project_id, db_path=self.db_path)
+            self.assertEqual([r.run_id for r in mine], ["mine"])
+
+    def test_stalled_flag_round_trips_as_bool(self):
+        memory.save_run(
+            self.project_id, self._run_dict(stalled=True), db_path=self.db_path,
+        )
+        run = memory.get_run("run-1", db_path=self.db_path)
+        self.assertIs(run["stalled"], True)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -25,10 +25,19 @@ project has an actual decision history, not just a current snapshot.
 
 A project is identified by the resolved path of its workspace, so the
 same workspace always maps to the same project across restarts.
+
+It also holds the structured, queryable task log: every run_task() call
+in full (its ordered tool calls, completion check, final status), keyed
+by project. run_record.py already wrote this to a per-run JSON file for
+human/debug reading (RUNS_DIR) — that stays as-is. What's new here is
+making run history actually queryable: "how many of my last 20 runs on
+this project failed", "show me what happened in the run where I fixed
+the auth bug", without opening files one at a time.
 """
 
 from __future__ import annotations
 
+import json
 import sqlite3
 import time
 from contextlib import contextmanager
@@ -62,6 +71,24 @@ CREATE TABLE IF NOT EXISTS memory_entries (
 
 CREATE INDEX IF NOT EXISTS idx_memory_project_kind
     ON memory_entries(project_id, kind, active);
+
+CREATE TABLE IF NOT EXISTS runs (
+    run_id TEXT PRIMARY KEY,
+    project_id INTEGER NOT NULL REFERENCES projects(id),
+    task TEXT NOT NULL,
+    model TEXT,
+    started_at REAL NOT NULL,
+    ended_at REAL,
+    final_status TEXT,
+    final_answer TEXT,
+    steps_taken INTEGER,
+    stalled INTEGER NOT NULL DEFAULT 0,
+    error TEXT,
+    tool_calls_json TEXT NOT NULL DEFAULT '[]'
+);
+
+CREATE INDEX IF NOT EXISTS idx_runs_project_started
+    ON runs(project_id, started_at);
 """
 
 
@@ -252,6 +279,124 @@ def history(project_id: int, db_path: Optional[Path] = None) -> list[MemoryEntry
             (project_id,),
         ).fetchall()
         return [MemoryEntry.from_row(row) for row in rows]
+
+
+@dataclass
+class RunSummary:
+    """A run without its tool_calls payload — cheap to list many of."""
+    run_id: str
+    project_id: int
+    task: str
+    model: Optional[str]
+    started_at: float
+    ended_at: Optional[float]
+    final_status: Optional[str]
+    final_answer: Optional[str]
+    steps_taken: Optional[int]
+    stalled: bool
+    error: Optional[str]
+
+    @classmethod
+    def from_row(cls, row: sqlite3.Row) -> "RunSummary":
+        return cls(
+            run_id=row["run_id"],
+            project_id=row["project_id"],
+            task=row["task"],
+            model=row["model"],
+            started_at=row["started_at"],
+            ended_at=row["ended_at"],
+            final_status=row["final_status"],
+            final_answer=row["final_answer"],
+            steps_taken=row["steps_taken"],
+            stalled=bool(row["stalled"]),
+            error=row["error"],
+        )
+
+
+def save_run(
+    project_id: int, run_dict: dict, db_path: Optional[Path] = None
+) -> None:
+    """Persist a run_record.RunRecord.to_dict() as a queryable row.
+    Idempotent on run_id (REPLACE) so saving the same run twice — e.g.
+    once on error, once at natural completion — just updates it rather
+    than duplicating or failing."""
+    db_path = db_path if db_path is not None else DB_PATH
+    with _open(db_path) as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO runs "
+            "(run_id, project_id, task, model, started_at, ended_at, "
+            " final_status, final_answer, steps_taken, stalled, error, "
+            " tool_calls_json) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                run_dict["run_id"],
+                project_id,
+                run_dict.get("task"),
+                run_dict.get("model"),
+                run_dict.get("started_at"),
+                run_dict.get("ended_at"),
+                run_dict.get("final_status"),
+                run_dict.get("final_answer"),
+                run_dict.get("steps_taken"),
+                int(bool(run_dict.get("stalled"))),
+                run_dict.get("error"),
+                json.dumps(run_dict.get("tool_calls", []), default=str),
+            ),
+        )
+
+
+def get_run(run_id: str, db_path: Optional[Path] = None) -> Optional[dict]:
+    """Full run, including its tool call history, as a plain dict."""
+    db_path = db_path if db_path is not None else DB_PATH
+    with _open(db_path) as conn:
+        row = conn.execute(
+            "SELECT * FROM runs WHERE run_id = ?", (run_id,)
+        ).fetchone()
+        if row is None:
+            return None
+
+        data = dict(row)
+        data["stalled"] = bool(data["stalled"])
+        data["tool_calls"] = json.loads(data.pop("tool_calls_json"))
+        return data
+
+
+def list_runs(
+    project_id: int, limit: Optional[int] = 20, db_path: Optional[Path] = None
+) -> list[RunSummary]:
+    """Most-recent-first run summaries for a project, without the
+    (potentially large) tool_calls payload — cheap enough to list."""
+    db_path = db_path if db_path is not None else DB_PATH
+    query = (
+        "SELECT run_id, project_id, task, model, started_at, ended_at, "
+        "final_status, final_answer, steps_taken, stalled, error "
+        "FROM runs WHERE project_id = ? ORDER BY started_at DESC"
+    )
+    params: list = [project_id]
+    if limit is not None:
+        query += " LIMIT ?"
+        params.append(limit)
+
+    with _open(db_path) as conn:
+        rows = conn.execute(query, params).fetchall()
+        return [RunSummary.from_row(row) for row in rows]
+
+
+def search_runs(
+    project_id: int, text: str, db_path: Optional[Path] = None
+) -> list[RunSummary]:
+    """Runs for this project whose task or final answer mentions `text`."""
+    db_path = db_path if db_path is not None else DB_PATH
+    with _open(db_path) as conn:
+        rows = conn.execute(
+            "SELECT run_id, project_id, task, model, started_at, ended_at, "
+            "final_status, final_answer, steps_taken, stalled, error "
+            "FROM runs WHERE project_id = ? "
+            "AND (task LIKE ? OR final_answer LIKE ?) "
+            "ORDER BY started_at DESC",
+            (project_id, f"%{text}%", f"%{text}%"),
+        ).fetchall()
+        return [RunSummary.from_row(row) for row in rows]
 
 
 def format_context(entries: list[MemoryEntry]) -> str:

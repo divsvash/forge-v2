@@ -1,0 +1,1181 @@
+From 0f1c3169a52dd67613da22ed85e13429abe22f37 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 12 Nov 2026 19:29:15 +0000
+Subject: [PATCH] Phase 02: reusable workflows (named, parameterised step
+ sequences)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Adds workflows.py — a project-scoped workflow layer backed by two new
+SQLite tables (workflows, workflow_runs) that live in the same DB as
+memory entries. A workflow is a named, ordered list of WorkflowStep
+prompt templates with {placeholder} variables filled at run time via
+str.format_map(). Executing a workflow calls run_task() once per step
+in order; stop_on_failure halts and marks remaining steps 'skipped' if
+any step returns a non-'complete' status.
+
+New modules / files:
+  workflows.py         — WorkflowStep, Workflow, WorkflowResult,
+                         StepResult dataclasses; save_workflow (upsert
+                         on project_id+name), get_workflow, list_workflows,
+                         delete_workflow, run_workflow, list_workflow_runs;
+                         _start/_finish_workflow_run internal helpers;
+                         WORKFLOW_SCHEMA applied on top of memory's existing
+                         schema so the projects FK constraint is always met.
+  test_workflows.py    — 24 tests across 4 classes:
+                         TestWorkflowCRUD (9), TestWorkflowStep (4),
+                         TestRunWorkflow (8), TestWorkflowToolsInForge (3).
+
+Changes to forge.py:
+  - `import workflows as _workflows` added.
+  - Four new tool functions: save_workflow_tool, run_workflow_tool,
+    list_workflows_tool, recall_workflow_runs_tool.
+  - Four new ToolSpec entries in TOOLS dict (risks: write / execute /
+    read / read).
+  - System prompt extended with full docs + JSON examples for all four
+    workflow tools.
+
+Design notes:
+  - Workflows are data, not code — stored as JSON step lists, never
+    executable code, so there is nothing to sandbox.
+  - run_workflow_tool passes forge.run_task as the executor, keeping
+    the evidence-ledger / completion-checking loop for every step.
+  - DB_PATH in workflows.py re-exports memory.DB_PATH so both modules
+    patch correctly in tests with patch.object(workflows, "DB_PATH", …)
+    alongside patch.object(memory, "DB_PATH", …).
+  - Deferred `import forge` inside run_workflow() avoids a circular
+    import at module load time (forge imports workflows; workflows must
+    not import forge at the top level).
+
+All 96 tests pass (72 prior + 24 new); no stray .db files produced.
+
+Co-Authored-By: Claude Sonnet 4.6 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01Nf1Av26L3kPBokvvZ1kN29
+---
+ forge.py          | 176 ++++++++++++++++
+ test_workflows.py | 388 +++++++++++++++++++++++++++++++++++
+ workflows.py      | 509 ++++++++++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 1073 insertions(+)
+ create mode 100644 test_workflows.py
+ create mode 100644 workflows.py
+
+diff --git a/forge.py b/forge.py
+index 7d3967b..7c829c3 100644
+--- a/forge.py
++++ b/forge.py
+@@ -10,6 +10,7 @@ from dataclasses import dataclass
+ import sandbox
+ import transactions
+ import memory
++import workflows as _workflows
+ from run_record import new_run, ToolCallRecord
+ 
+ success_definition = None
+@@ -171,6 +172,68 @@ def recall_runs(query=None, limit=10):
+         for run in runs
+     ]
+ 
++# ---------- WORKFLOW TOOLS ----------
++
++def save_workflow_tool(name, steps, description="", stop_on_failure=False):
++    """
++    Define (or update) a named, reusable workflow for this project.
++    `steps` is a list of {name, prompt_template} dicts. Placeholders
++    like {filename} in a prompt_template are filled when the workflow
++    runs. Returns the workflow id.
++    """
++    project_id = get_project_id()
++    wf_steps = [_workflows.WorkflowStep(**s) for s in steps]
++    wf_id = _workflows.save_workflow(
++        project_id, name, wf_steps,
++        description=description,
++        stop_on_failure=stop_on_failure,
++    )
++    return {"workflow_id": wf_id, "name": name, "steps": len(wf_steps)}
++
++
++def run_workflow_tool(name, params=None):
++    """
++    Run a saved workflow by name, substituting any {placeholders} in
++    step prompts with the values in `params`. Returns a summary of each
++    step's outcome (step_name, status, answer, run_id).
++    """
++    project_id = get_project_id()
++    result = _workflows.run_workflow(
++        project_id, name, params=params or {},
++        run_task_fn=run_task,
++    )
++    return result.to_dict()
++
++
++def list_workflows_tool():
++    """
++    List the named workflows defined for this project, with their step
++    counts and descriptions.
++    """
++    project_id = get_project_id()
++    wfs = _workflows.list_workflows(project_id)
++    return [
++        {
++            "name": wf.name,
++            "description": wf.description,
++            "steps": len(wf.steps),
++            "stop_on_failure": wf.stop_on_failure,
++        }
++        for wf in wfs
++    ]
++
++
++def recall_workflow_runs_tool(workflow_name=None, limit=10):
++    """
++    Retrieve past runs of workflows for this project. Optionally filter
++    to a specific workflow_name. Returns run status and per-step outcomes.
++    """
++    project_id = get_project_id()
++    return _workflows.list_workflow_runs(
++        project_id, workflow_name=workflow_name, limit=limit,
++    )
++
++
+ def search_files(query):
+     matches = []
+ 
+@@ -331,6 +394,66 @@ TOOLS = {
+         risk="read",
+         sandboxed=False,
+     ),
++    "save_workflow": ToolSpec(
++        name="save_workflow",
++        func=save_workflow_tool,
++        schema={
++            "type": "object",
++            "properties": {
++                "name": {"type": "string"},
++                "steps": {
++                    "type": "array",
++                    "items": {
++                        "type": "object",
++                        "properties": {
++                            "name": {"type": "string"},
++                            "prompt_template": {"type": "string"},
++                        },
++                        "required": ["name", "prompt_template"],
++                    },
++                },
++                "description": {"type": "string"},
++                "stop_on_failure": {"type": "boolean"},
++            },
++            "required": ["name", "steps"],
++        },
++        risk="write",
++        sandboxed=False,
++    ),
++    "run_workflow": ToolSpec(
++        name="run_workflow",
++        func=run_workflow_tool,
++        schema={
++            "type": "object",
++            "properties": {
++                "name": {"type": "string"},
++                "params": {"type": "object"},
++            },
++            "required": ["name"],
++        },
++        risk="execute",
++        sandboxed=False,
++    ),
++    "list_workflows": ToolSpec(
++        name="list_workflows",
++        func=list_workflows_tool,
++        schema={"type": "object", "properties": {}},
++        risk="read",
++        sandboxed=False,
++    ),
++    "recall_workflow_runs": ToolSpec(
++        name="recall_workflow_runs",
++        func=recall_workflow_runs_tool,
++        schema={
++            "type": "object",
++            "properties": {
++                "workflow_name": {"type": "string"},
++                "limit": {"type": "integer"},
++            },
++        },
++        risk="read",
++        sandboxed=False,
++    ),
+ }
+ 
+ 
+@@ -648,6 +771,59 @@ Another example:
+   }
+ }
+ 
++save_workflow:
++Define (or update) a named, reusable workflow for this project. A workflow
++is an ordered list of steps; each step has a name and a prompt_template.
++Placeholders in prompt_template like {filename} are filled with values
++from the params dict when the workflow runs. Use stop_on_failure: true to
++halt the workflow if any step does not complete cleanly.
++
++{
++  "tool": "save_workflow",
++  "arguments": {
++    "name": "code-review",
++    "description": "Inspect a file, run its tests, summarise findings",
++    "stop_on_failure": true,
++    "steps": [
++      {"name": "inspect",  "prompt_template": "Read {filename} and list any obvious issues."},
++      {"name": "test",     "prompt_template": "Run the tests for {filename} and report results."},
++      {"name": "summarise","prompt_template": "Summarise the findings from inspecting and testing {filename}."}
++    ]
++  }
++}
++
++run_workflow:
++Execute a saved workflow by name. Pass any placeholder values in params.
++Returns per-step outcomes (step_name, status, answer, run_id).
++
++{
++  "tool": "run_workflow",
++  "arguments": {
++    "name": "code-review",
++    "params": {"filename": "calc.py"}
++  }
++}
++
++list_workflows:
++List all named workflows defined for this project.
++
++{
++  "tool": "list_workflows",
++  "arguments": {}
++}
++
++recall_workflow_runs:
++Retrieve past executions of workflows for this project. Filter to a
++specific workflow with workflow_name.
++
++{
++  "tool": "recall_workflow_runs",
++  "arguments": {
++    "workflow_name": "code-review",
++    "limit": 5
++  }
++}
++
+ Do not invent files.
+ Do not access files outside the workspace.
+ 
+diff --git a/test_workflows.py b/test_workflows.py
+new file mode 100644
+index 0000000..cc7c470
+--- /dev/null
++++ b/test_workflows.py
+@@ -0,0 +1,388 @@
++"""
++test_workflows.py — unit tests for workflows.py
++
++Tests are isolated: every case gets its own TemporaryDirectory for the
++SQLite DB (via patch.object) so no state leaks between tests and nothing
++is ever written to the real forge_memory.db.
++"""
++
++import unittest
++from pathlib import Path
++from tempfile import TemporaryDirectory
++from unittest.mock import patch, MagicMock
++
++import workflows
++import memory
++
++
++class TestWorkflowCRUD(unittest.TestCase):
++    def setUp(self):
++        self._tmp = TemporaryDirectory()
++        self.db_path = Path(self._tmp.name) / "test_wf.db"
++        self._ws = TemporaryDirectory()
++        # DB_PATH must be patched on BOTH modules since workflows.py
++        # re-exports it from memory.DB_PATH at import time.
++        with patch.object(memory, "DB_PATH", self.db_path), \
++             patch.object(workflows, "DB_PATH", self.db_path):
++            self.project_id = memory.get_or_create_project(Path(self._ws.name))
++
++    def tearDown(self):
++        self._tmp.cleanup()
++        self._ws.cleanup()
++
++    def _save(self, name="my-wf", steps=None, **kwargs):
++        if steps is None:
++            steps = [
++                workflows.WorkflowStep("step1", "do {thing}"),
++                workflows.WorkflowStep("step2", "verify {thing}"),
++            ]
++        return workflows.save_workflow(
++            self.project_id, name, steps, db_path=self.db_path, **kwargs
++        )
++
++    # --- save / get / list ---
++
++    def test_save_and_get_round_trip(self):
++        wf_id = self._save("review", description="A review workflow")
++        wf = workflows.get_workflow(self.project_id, "review", db_path=self.db_path)
++        self.assertIsNotNone(wf)
++        self.assertEqual(wf.id, wf_id)
++        self.assertEqual(wf.name, "review")
++        self.assertEqual(wf.description, "A review workflow")
++        self.assertEqual(len(wf.steps), 2)
++
++    def test_get_returns_none_for_unknown_name(self):
++        wf = workflows.get_workflow(self.project_id, "nonexistent", db_path=self.db_path)
++        self.assertIsNone(wf)
++
++    def test_save_is_idempotent_on_name(self):
++        """Saving the same name twice updates, not duplicates."""
++        self._save("my-wf")
++        updated_steps = [workflows.WorkflowStep("only-step", "do everything")]
++        self._save("my-wf", steps=updated_steps, description="updated")
++
++        wfs = workflows.list_workflows(self.project_id, db_path=self.db_path)
++        self.assertEqual(len(wfs), 1)
++        self.assertEqual(len(wfs[0].steps), 1)
++        self.assertEqual(wfs[0].description, "updated")
++
++    def test_list_workflows_alphabetical(self):
++        self._save("zebra")
++        self._save("apple")
++        self._save("mango")
++        wfs = workflows.list_workflows(self.project_id, db_path=self.db_path)
++        self.assertEqual([w.name for w in wfs], ["apple", "mango", "zebra"])
++
++    def test_list_workflows_empty_for_new_project(self):
++        with TemporaryDirectory() as ws2:
++            with patch.object(memory, "DB_PATH", self.db_path), \
++                 patch.object(workflows, "DB_PATH", self.db_path):
++                pid2 = memory.get_or_create_project(Path(ws2))
++            wfs = workflows.list_workflows(pid2, db_path=self.db_path)
++            self.assertEqual(wfs, [])
++
++    def test_delete_workflow(self):
++        self._save("to-delete")
++        deleted = workflows.delete_workflow(
++            self.project_id, "to-delete", db_path=self.db_path
++        )
++        self.assertTrue(deleted)
++        wf = workflows.get_workflow(self.project_id, "to-delete", db_path=self.db_path)
++        self.assertIsNone(wf)
++
++    def test_delete_nonexistent_returns_false(self):
++        result = workflows.delete_workflow(
++            self.project_id, "ghost", db_path=self.db_path
++        )
++        self.assertFalse(result)
++
++    def test_workflows_scoped_per_project(self):
++        with TemporaryDirectory() as ws2:
++            with patch.object(memory, "DB_PATH", self.db_path), \
++                 patch.object(workflows, "DB_PATH", self.db_path):
++                pid2 = memory.get_or_create_project(Path(ws2))
++            self._save("shared-name")
++            # Same name, different project — independent rows
++            workflows.save_workflow(
++                pid2, "shared-name",
++                [workflows.WorkflowStep("x", "do x")],
++                db_path=self.db_path,
++            )
++            wf1 = workflows.get_workflow(self.project_id, "shared-name", db_path=self.db_path)
++            wf2 = workflows.get_workflow(pid2, "shared-name", db_path=self.db_path)
++            self.assertNotEqual(wf1.id, wf2.id)
++            self.assertEqual(len(wf1.steps), 2)
++            self.assertEqual(len(wf2.steps), 1)
++
++    def test_stop_on_failure_persists(self):
++        self._save("halt-wf", stop_on_failure=True)
++        wf = workflows.get_workflow(self.project_id, "halt-wf", db_path=self.db_path)
++        self.assertTrue(wf.stop_on_failure)
++
++
++class TestWorkflowStep(unittest.TestCase):
++    def test_render_fills_placeholders(self):
++        step = workflows.WorkflowStep("s", "inspect {filename} in branch {branch}")
++        rendered = step.render({"filename": "calc.py", "branch": "main"})
++        self.assertEqual(rendered, "inspect calc.py in branch main")
++
++    def test_render_raises_on_missing_placeholder(self):
++        step = workflows.WorkflowStep("s", "do {missing}")
++        with self.assertRaises(KeyError):
++            step.render({})
++
++    def test_render_with_no_placeholders(self):
++        step = workflows.WorkflowStep("s", "list all files")
++        self.assertEqual(step.render({}), "list all files")
++
++    def test_to_dict_round_trip(self):
++        step = workflows.WorkflowStep("my-step", "prompt {x}")
++        d = step.to_dict()
++        restored = workflows.WorkflowStep.from_dict(d)
++        self.assertEqual(restored.name, step.name)
++        self.assertEqual(restored.prompt_template, step.prompt_template)
++
++
++class TestRunWorkflow(unittest.TestCase):
++    def setUp(self):
++        self._tmp = TemporaryDirectory()
++        self.db_path = Path(self._tmp.name) / "test_run_wf.db"
++        self._ws = TemporaryDirectory()
++        with patch.object(memory, "DB_PATH", self.db_path), \
++             patch.object(workflows, "DB_PATH", self.db_path):
++            self.project_id = memory.get_or_create_project(Path(self._ws.name))
++
++        # Save a 2-step workflow with a placeholder
++        workflows.save_workflow(
++            self.project_id,
++            "review",
++            [
++                workflows.WorkflowStep("inspect", "inspect {filename}"),
++                workflows.WorkflowStep("test",    "test {filename}"),
++            ],
++            db_path=self.db_path,
++        )
++
++    def tearDown(self):
++        self._tmp.cleanup()
++        self._ws.cleanup()
++
++    def _fake_run_task(self, prompt):
++        return {
++            "run_id": f"fake-{prompt[:8].replace(' ', '-')}",
++            "final_status": "complete",
++            "answer": f"done: {prompt}",
++        }
++
++    def test_run_workflow_calls_run_task_per_step(self):
++        calls = []
++
++        def capturing_run_task(prompt):
++            calls.append(prompt)
++            return {"run_id": "r1", "final_status": "complete", "answer": "ok"}
++
++        result = workflows.run_workflow(
++            self.project_id, "review",
++            params={"filename": "calc.py"},
++            run_task_fn=capturing_run_task,
++            db_path=self.db_path,
++        )
++        self.assertEqual(len(calls), 2)
++        self.assertIn("calc.py", calls[0])
++        self.assertIn("calc.py", calls[1])
++        self.assertEqual(result.status, "complete")
++
++    def test_run_workflow_result_has_step_results(self):
++        result = workflows.run_workflow(
++            self.project_id, "review",
++            params={"filename": "calc.py"},
++            run_task_fn=self._fake_run_task,
++            db_path=self.db_path,
++        )
++        self.assertEqual(len(result.step_results), 2)
++        self.assertEqual(result.step_results[0].step_name, "inspect")
++        self.assertEqual(result.step_results[1].step_name, "test")
++
++    def test_run_nonexistent_workflow_returns_error(self):
++        result = workflows.run_workflow(
++            self.project_id, "no-such-workflow",
++            run_task_fn=self._fake_run_task,
++            db_path=self.db_path,
++        )
++        self.assertEqual(result.status, "error")
++        self.assertIn("no-such-workflow", result.step_results[0].error)
++
++    def test_missing_placeholder_captured_as_error_step(self):
++        result = workflows.run_workflow(
++            self.project_id, "review",
++            params={},  # filename not supplied
++            run_task_fn=self._fake_run_task,
++            db_path=self.db_path,
++        )
++        self.assertEqual(result.step_results[0].status, "error")
++        self.assertIn("Missing workflow parameter", result.step_results[0].error)
++
++    def test_stop_on_failure_skips_later_steps(self):
++        workflows.save_workflow(
++            self.project_id,
++            "halt-wf",
++            [
++                workflows.WorkflowStep("step1", "step one"),
++                workflows.WorkflowStep("step2", "step two"),
++                workflows.WorkflowStep("step3", "step three"),
++            ],
++            stop_on_failure=True,
++            db_path=self.db_path,
++        )
++
++        call_count = [0]
++
++        def failing_first(prompt):
++            call_count[0] += 1
++            if "one" in prompt:
++                return {"run_id": "r1", "final_status": "error", "answer": None}
++            return {"run_id": "r2", "final_status": "complete", "answer": "ok"}
++
++        result = workflows.run_workflow(
++            self.project_id, "halt-wf",
++            run_task_fn=failing_first,
++            db_path=self.db_path,
++        )
++        # Only the first step should have been called
++        self.assertEqual(call_count[0], 1)
++        self.assertEqual(result.step_results[1].status, "skipped")
++        self.assertEqual(result.step_results[2].status, "skipped")
++        self.assertEqual(result.status, "partial")
++
++    def test_run_records_saved_to_db(self):
++        workflows.run_workflow(
++            self.project_id, "review",
++            params={"filename": "calc.py"},
++            run_task_fn=self._fake_run_task,
++            db_path=self.db_path,
++        )
++        runs = workflows.list_workflow_runs(
++            self.project_id, db_path=self.db_path
++        )
++        self.assertEqual(len(runs), 1)
++        self.assertEqual(runs[0]["workflow_name"], "review")
++        self.assertEqual(runs[0]["status"], "complete")
++        self.assertEqual(len(runs[0]["step_results"]), 2)
++
++    def test_list_workflow_runs_filters_by_name(self):
++        workflows.save_workflow(
++            self.project_id, "other",
++            [workflows.WorkflowStep("x", "do x")],
++            db_path=self.db_path,
++        )
++        workflows.run_workflow(
++            self.project_id, "review",
++            params={"filename": "f.py"},
++            run_task_fn=self._fake_run_task,
++            db_path=self.db_path,
++        )
++        workflows.run_workflow(
++            self.project_id, "other",
++            run_task_fn=self._fake_run_task,
++            db_path=self.db_path,
++        )
++
++        runs = workflows.list_workflow_runs(
++            self.project_id, workflow_name="review", db_path=self.db_path
++        )
++        self.assertEqual(len(runs), 1)
++        self.assertEqual(runs[0]["workflow_name"], "review")
++
++    def test_workflow_result_to_dict_is_serialisable(self):
++        import json as _json
++        result = workflows.run_workflow(
++            self.project_id, "review",
++            params={"filename": "calc.py"},
++            run_task_fn=self._fake_run_task,
++            db_path=self.db_path,
++        )
++        # Must not raise
++        serialised = _json.dumps(result.to_dict())
++        self.assertIn("review", serialised)
++
++
++class TestWorkflowToolsInForge(unittest.TestCase):
++    """
++    End-to-end: forge.py's save_workflow_tool / list_workflows_tool /
++    run_workflow_tool / recall_workflow_runs_tool wired up correctly.
++    """
++
++    def setUp(self):
++        self._tmp = TemporaryDirectory()
++        self.db_path = Path(self._tmp.name) / "forge_wf.db"
++        self._ws = TemporaryDirectory()
++
++    def tearDown(self):
++        self._tmp.cleanup()
++        self._ws.cleanup()
++
++    def test_save_and_list_via_forge_tools(self):
++        import forge
++
++        with patch.object(forge, "WORKSPACE", Path(self._ws.name)), \
++             patch.object(memory, "DB_PATH", self.db_path), \
++             patch.object(workflows, "DB_PATH", self.db_path):
++            save_result = forge.save_workflow_tool(
++                name="hello",
++                steps=[{"name": "greet", "prompt_template": "say hello"}],
++                description="a greeting",
++            )
++            self.assertEqual(save_result["name"], "hello")
++
++            listed = forge.list_workflows_tool()
++            self.assertEqual(len(listed), 1)
++            self.assertEqual(listed[0]["name"], "hello")
++
++    def test_run_workflow_via_forge_tool(self):
++        import forge
++
++        calls = []
++
++        def mock_run_task(prompt):
++            calls.append(prompt)
++            return {"run_id": "r1", "final_status": "complete", "answer": "done"}
++
++        with patch.object(forge, "WORKSPACE", Path(self._ws.name)), \
++             patch.object(memory, "DB_PATH", self.db_path), \
++             patch.object(workflows, "DB_PATH", self.db_path), \
++             patch.object(forge, "run_task", mock_run_task):
++
++            forge.save_workflow_tool(
++                name="greet",
++                steps=[{"name": "say", "prompt_template": "hello {who}"}],
++            )
++            result = forge.run_workflow_tool("greet", params={"who": "world"})
++
++        self.assertEqual(result["status"], "complete")
++        self.assertEqual(len(calls), 1)
++        self.assertIn("world", calls[0])
++
++    def test_recall_workflow_runs_via_forge_tool(self):
++        import forge
++
++        def mock_run_task(prompt):
++            return {"run_id": "r1", "final_status": "complete", "answer": "done"}
++
++        with patch.object(forge, "WORKSPACE", Path(self._ws.name)), \
++             patch.object(memory, "DB_PATH", self.db_path), \
++             patch.object(workflows, "DB_PATH", self.db_path), \
++             patch.object(forge, "run_task", mock_run_task):
++
++            forge.save_workflow_tool(
++                name="greet",
++                steps=[{"name": "say", "prompt_template": "hello"}],
++            )
++            forge.run_workflow_tool("greet")
++            runs = forge.recall_workflow_runs_tool(workflow_name="greet")
++
++        self.assertEqual(len(runs), 1)
++        self.assertEqual(runs[0]["status"], "complete")
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/workflows.py b/workflows.py
+new file mode 100644
+index 0000000..7e6b9dd
+--- /dev/null
++++ b/workflows.py
+@@ -0,0 +1,509 @@
++"""
++workflows.py — named, parameterized, storable step sequences for Forge.
++
++Phase 02 ("Everyday agent") includes "reusable workflows": things Forge
++does often enough that they shouldn't be re-planned from scratch every
++time. A workflow is a named list of prompt templates, each of which
++becomes one run_task() call when the workflow is executed.
++
++Design principles:
++
++  Workflows are data, not code
++    A workflow is a JSON-serialisable dict stored in SQLite (same DB as
++    memory.py, same project scope). No code gets stored; a "step" is a
++    prompt template string with {placeholder} variables that are filled
++    at run time.
++
++  Separation of definition and execution
++    Defining a workflow never calls run_task(). Executing it calls
++    run_task() once per step, in order, passing each step's rendered
++    prompt. The caller (forge.py) owns run_task; this module owns the
++    definition and rendering layer.
++
++  Parameterised via simple string interpolation
++    Placeholders use Python's str.format_map(), so {filename}, {branch},
++    {ticket} etc. are supported. Unknown placeholders raise a clear
++    KeyError rather than silently producing broken prompts.
++
++  Steps can be skipped on prior-step failure
++    By default all steps run regardless. Set `stop_on_failure=True` on
++    the workflow to halt as soon as a step's run_task() returns a
++    non-"complete" status.
++
++  Project-scoped
++    Workflows live under a project id (same as memory entries) so a
++    workflow named "code-review" for project A is distinct from one for
++    project B.
++
++  Idempotent upsert on name + project_id
++    Saving a workflow with the same name and project updates it rather
++    than duplicating it.
++
++Schema added to memory.py's existing DB:
++
++    workflows (
++        id INTEGER PK,
++        project_id INTEGER FK → projects(id),
++        name TEXT,
++        description TEXT,
++        steps_json TEXT,       -- JSON list of {name, prompt_template}
++        stop_on_failure INTEGER DEFAULT 0,
++        created_at REAL,
++        updated_at REAL,
++        UNIQUE(project_id, name)
++    )
++
++    workflow_runs (
++        id INTEGER PK,
++        workflow_id INTEGER FK → workflows(id),
++        project_id INTEGER FK → projects(id),
++        params_json TEXT,      -- the {placeholder: value} dict used
++        started_at REAL,
++        ended_at REAL,
++        status TEXT,           -- 'complete' | 'partial' | 'error'
++        step_results_json TEXT -- list of {step_name, run_id, status, answer}
++    )
++"""
++
++from __future__ import annotations
++
++import json
++import sqlite3
++import time
++from contextlib import contextmanager
++from dataclasses import dataclass, field
++from pathlib import Path
++from typing import Callable, Optional
++
++import memory as _mem
++
++# Re-use memory.py's DB_PATH so workflows live alongside memory entries.
++DB_PATH = _mem.DB_PATH
++
++WORKFLOW_SCHEMA = """
++CREATE TABLE IF NOT EXISTS workflows (
++    id INTEGER PRIMARY KEY AUTOINCREMENT,
++    project_id INTEGER NOT NULL REFERENCES projects(id),
++    name TEXT NOT NULL,
++    description TEXT,
++    steps_json TEXT NOT NULL DEFAULT '[]',
++    stop_on_failure INTEGER NOT NULL DEFAULT 0,
++    created_at REAL NOT NULL,
++    updated_at REAL NOT NULL,
++    UNIQUE(project_id, name)
++);
++
++CREATE INDEX IF NOT EXISTS idx_workflows_project
++    ON workflows(project_id);
++
++CREATE TABLE IF NOT EXISTS workflow_runs (
++    id INTEGER PRIMARY KEY AUTOINCREMENT,
++    workflow_id INTEGER NOT NULL REFERENCES workflows(id),
++    project_id INTEGER NOT NULL REFERENCES projects(id),
++    params_json TEXT NOT NULL DEFAULT '{}',
++    started_at REAL NOT NULL,
++    ended_at REAL,
++    status TEXT,
++    step_results_json TEXT NOT NULL DEFAULT '[]'
++);
++
++CREATE INDEX IF NOT EXISTS idx_workflow_runs_project
++    ON workflow_runs(project_id, started_at);
++"""
++
++
++@dataclass
++class WorkflowStep:
++    name: str
++    prompt_template: str
++
++    def render(self, params: dict) -> str:
++        """Fill placeholders using params. Raises KeyError for missing keys."""
++        return self.prompt_template.format_map(params)
++
++    def to_dict(self) -> dict:
++        return {"name": self.name, "prompt_template": self.prompt_template}
++
++    @classmethod
++    def from_dict(cls, d: dict) -> "WorkflowStep":
++        return cls(name=d["name"], prompt_template=d["prompt_template"])
++
++
++@dataclass
++class Workflow:
++    id: int
++    project_id: int
++    name: str
++    description: str
++    steps: list[WorkflowStep]
++    stop_on_failure: bool
++    created_at: float
++    updated_at: float
++
++    def to_dict(self) -> dict:
++        return {
++            "id": self.id,
++            "project_id": self.project_id,
++            "name": self.name,
++            "description": self.description,
++            "steps": [s.to_dict() for s in self.steps],
++            "stop_on_failure": self.stop_on_failure,
++            "created_at": self.created_at,
++            "updated_at": self.updated_at,
++        }
++
++    @classmethod
++    def from_row(cls, row: sqlite3.Row) -> "Workflow":
++        return cls(
++            id=row["id"],
++            project_id=row["project_id"],
++            name=row["name"],
++            description=row["description"] or "",
++            steps=[WorkflowStep.from_dict(s) for s in json.loads(row["steps_json"])],
++            stop_on_failure=bool(row["stop_on_failure"]),
++            created_at=row["created_at"],
++            updated_at=row["updated_at"],
++        )
++
++
++@dataclass
++class StepResult:
++    step_name: str
++    run_id: Optional[str]
++    status: str          # 'complete' | 'error' | 'stalled' | 'skipped'
++    answer: Optional[str]
++    error: Optional[str] = None
++
++    def to_dict(self) -> dict:
++        return {
++            "step_name": self.step_name,
++            "run_id": self.run_id,
++            "status": self.status,
++            "answer": self.answer,
++            "error": self.error,
++        }
++
++
++@dataclass
++class WorkflowResult:
++    workflow_name: str
++    params: dict
++    status: str          # 'complete' | 'partial' | 'error'
++    step_results: list[StepResult] = field(default_factory=list)
++    workflow_run_id: Optional[int] = None
++
++    def to_dict(self) -> dict:
++        return {
++            "workflow_name": self.workflow_name,
++            "params": self.params,
++            "status": self.status,
++            "step_results": [r.to_dict() for r in self.step_results],
++            "workflow_run_id": self.workflow_run_id,
++        }
++
++
++# ---------------------------------------------------------------------------
++# DB helpers (mirror memory.py's pattern exactly so patch.object works)
++# ---------------------------------------------------------------------------
++
++def _connect(db_path: Path) -> sqlite3.Connection:
++    conn = sqlite3.connect(db_path)
++    conn.row_factory = sqlite3.Row
++    conn.execute("PRAGMA foreign_keys = ON")
++    return conn
++
++
++@contextmanager
++def _open(db_path: Path):
++    conn = _connect(db_path)
++    try:
++        # Ensure memory schema exists first (projects table must exist
++        # before our FK to it), then apply our own schema.
++        conn.executescript(_mem.SCHEMA)
++        conn.executescript(WORKFLOW_SCHEMA)
++        yield conn
++        conn.commit()
++    finally:
++        conn.close()
++
++
++# ---------------------------------------------------------------------------
++# Public API
++# ---------------------------------------------------------------------------
++
++def save_workflow(
++    project_id: int,
++    name: str,
++    steps: list[WorkflowStep],
++    description: str = "",
++    stop_on_failure: bool = False,
++    db_path: Optional[Path] = None,
++) -> int:
++    """Create or update (upsert) a workflow. Returns its id."""
++    db_path = db_path if db_path is not None else DB_PATH
++    now = time.time()
++    steps_json = json.dumps([s.to_dict() for s in steps])
++    with _open(db_path) as conn:
++        existing = conn.execute(
++            "SELECT id FROM workflows WHERE project_id = ? AND name = ?",
++            (project_id, name),
++        ).fetchone()
++
++        if existing:
++            conn.execute(
++                "UPDATE workflows SET description=?, steps_json=?, "
++                "stop_on_failure=?, updated_at=? WHERE id=?",
++                (description, steps_json, int(stop_on_failure), now, existing["id"]),
++            )
++            return existing["id"]
++
++        cursor = conn.execute(
++            "INSERT INTO workflows "
++            "(project_id, name, description, steps_json, stop_on_failure, "
++            " created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
++            (project_id, name, description, steps_json,
++             int(stop_on_failure), now, now),
++        )
++        return cursor.lastrowid
++
++
++def get_workflow(
++    project_id: int,
++    name: str,
++    db_path: Optional[Path] = None,
++) -> Optional[Workflow]:
++    """Look up a workflow by project + name. Returns None if not found."""
++    db_path = db_path if db_path is not None else DB_PATH
++    with _open(db_path) as conn:
++        row = conn.execute(
++            "SELECT * FROM workflows WHERE project_id = ? AND name = ?",
++            (project_id, name),
++        ).fetchone()
++        return Workflow.from_row(row) if row else None
++
++
++def list_workflows(
++    project_id: int,
++    db_path: Optional[Path] = None,
++) -> list[Workflow]:
++    """All workflows for a project, alphabetically by name."""
++    db_path = db_path if db_path is not None else DB_PATH
++    with _open(db_path) as conn:
++        rows = conn.execute(
++            "SELECT * FROM workflows WHERE project_id = ? ORDER BY name ASC",
++            (project_id,),
++        ).fetchall()
++        return [Workflow.from_row(row) for row in rows]
++
++
++def delete_workflow(
++    project_id: int,
++    name: str,
++    db_path: Optional[Path] = None,
++) -> bool:
++    """Delete a workflow by name. Returns True if it existed."""
++    db_path = db_path if db_path is not None else DB_PATH
++    with _open(db_path) as conn:
++        row = conn.execute(
++            "SELECT id FROM workflows WHERE project_id = ? AND name = ?",
++            (project_id, name),
++        ).fetchone()
++        if not row:
++            return False
++        conn.execute("DELETE FROM workflows WHERE id = ?", (row["id"],))
++        return True
++
++
++def run_workflow(
++    project_id: int,
++    name: str,
++    params: Optional[dict] = None,
++    run_task_fn: Optional[Callable] = None,
++    db_path: Optional[Path] = None,
++) -> WorkflowResult:
++    """
++    Execute a named workflow by running each step's rendered prompt
++    through run_task_fn (defaults to forge.run_task when None — the
++    import is deferred so workflows.py doesn't create a circular import
++    at module load time).
++
++    Returns a WorkflowResult with per-step outcomes. Never raises: errors
++    are captured into StepResult.error so the caller gets a full picture
++    of what ran and what failed.
++    """
++    db_path = db_path if db_path is not None else DB_PATH
++    params = params or {}
++
++    if run_task_fn is None:
++        import forge as _forge  # deferred to avoid circular import
++        run_task_fn = _forge.run_task
++
++    workflow = get_workflow(project_id, name, db_path=db_path)
++    if workflow is None:
++        return WorkflowResult(
++            workflow_name=name,
++            params=params,
++            status="error",
++            step_results=[
++                StepResult(
++                    step_name="<lookup>",
++                    run_id=None,
++                    status="error",
++                    answer=None,
++                    error=f"No workflow named {name!r} found for this project.",
++                )
++            ],
++        )
++
++    # Record the run start
++    run_id = _start_workflow_run(project_id, workflow.id, params, db_path)
++    step_results: list[StepResult] = []
++    overall_status = "complete"
++    started_at = time.time()
++
++    for step in workflow.steps:
++        # Render the prompt; catch missing placeholders.
++        try:
++            prompt = step.render(params)
++        except KeyError as exc:
++            sr = StepResult(
++                step_name=step.name,
++                run_id=None,
++                status="error",
++                answer=None,
++                error=f"Missing workflow parameter: {exc}",
++            )
++            step_results.append(sr)
++            overall_status = "partial" if step_results else "error"
++            if workflow.stop_on_failure:
++                break
++            continue
++
++        # Execute the step.
++        try:
++            result = run_task_fn(prompt)
++            step_status = result.get("final_status", "error")
++            sr = StepResult(
++                step_name=step.name,
++                run_id=result.get("run_id"),
++                status=step_status,
++                answer=result.get("answer"),
++            )
++        except Exception as exc:  # noqa: BLE001
++            sr = StepResult(
++                step_name=step.name,
++                run_id=None,
++                status="error",
++                answer=None,
++                error=str(exc),
++            )
++
++        step_results.append(sr)
++
++        if sr.status != "complete":
++            overall_status = "partial"
++            if workflow.stop_on_failure:
++                # Mark remaining steps as skipped.
++                for remaining in workflow.steps[len(step_results):]:
++                    step_results.append(StepResult(
++                        step_name=remaining.name,
++                        run_id=None,
++                        status="skipped",
++                        answer=None,
++                    ))
++                break
++
++    _finish_workflow_run(run_id, overall_status, step_results, db_path)
++
++    return WorkflowResult(
++        workflow_name=name,
++        params=params,
++        status=overall_status,
++        step_results=step_results,
++        workflow_run_id=run_id,
++    )
++
++
++def list_workflow_runs(
++    project_id: int,
++    workflow_name: Optional[str] = None,
++    limit: int = 20,
++    db_path: Optional[Path] = None,
++) -> list[dict]:
++    """
++    Recent workflow run summaries for a project, most-recent-first.
++    Optionally filtered to a specific workflow name.
++    """
++    db_path = db_path if db_path is not None else DB_PATH
++    with _open(db_path) as conn:
++        if workflow_name:
++            wf_row = conn.execute(
++                "SELECT id FROM workflows WHERE project_id = ? AND name = ?",
++                (project_id, workflow_name),
++            ).fetchone()
++            if not wf_row:
++                return []
++            rows = conn.execute(
++                "SELECT wr.*, w.name as workflow_name FROM workflow_runs wr "
++                "JOIN workflows w ON w.id = wr.workflow_id "
++                "WHERE wr.project_id = ? AND wr.workflow_id = ? "
++                "ORDER BY wr.started_at DESC LIMIT ?",
++                (project_id, wf_row["id"], limit),
++            ).fetchall()
++        else:
++            rows = conn.execute(
++                "SELECT wr.*, w.name as workflow_name FROM workflow_runs wr "
++                "JOIN workflows w ON w.id = wr.workflow_id "
++                "WHERE wr.project_id = ? ORDER BY wr.started_at DESC LIMIT ?",
++                (project_id, limit),
++            ).fetchall()
++
++        results = []
++        for row in rows:
++            results.append({
++                "id": row["id"],
++                "workflow_name": row["workflow_name"],
++                "started_at": row["started_at"],
++                "ended_at": row["ended_at"],
++                "status": row["status"],
++                "params": json.loads(row["params_json"]),
++                "step_results": json.loads(row["step_results_json"]),
++            })
++        return results
++
++
++# ---------------------------------------------------------------------------
++# Internal helpers
++# ---------------------------------------------------------------------------
++
++def _start_workflow_run(
++    project_id: int,
++    workflow_id: int,
++    params: dict,
++    db_path: Path,
++) -> int:
++    with _open(db_path) as conn:
++        cursor = conn.execute(
++            "INSERT INTO workflow_runs "
++            "(workflow_id, project_id, params_json, started_at, "
++            " status, step_results_json) "
++            "VALUES (?, ?, ?, ?, ?, ?)",
++            (workflow_id, project_id, json.dumps(params), time.time(),
++             "running", "[]"),
++        )
++        return cursor.lastrowid
++
++
++def _finish_workflow_run(
++    run_id: int,
++    status: str,
++    step_results: list[StepResult],
++    db_path: Path,
++) -> None:
++    with _open(db_path) as conn:
++        conn.execute(
++            "UPDATE workflow_runs SET ended_at=?, status=?, step_results_json=? "
++            "WHERE id=?",
++            (time.time(), status,
++             json.dumps([r.to_dict() for r in step_results]), run_id),
++        )
+-- 
+2.43.0

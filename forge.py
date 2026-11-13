@@ -10,6 +10,7 @@ from dataclasses import dataclass
 import sandbox
 import transactions
 import memory
+import workflows as _workflows
 from run_record import new_run, ToolCallRecord
 
 success_definition = None
@@ -171,6 +172,68 @@ def recall_runs(query=None, limit=10):
         for run in runs
     ]
 
+# ---------- WORKFLOW TOOLS ----------
+
+def save_workflow_tool(name, steps, description="", stop_on_failure=False):
+    """
+    Define (or update) a named, reusable workflow for this project.
+    `steps` is a list of {name, prompt_template} dicts. Placeholders
+    like {filename} in a prompt_template are filled when the workflow
+    runs. Returns the workflow id.
+    """
+    project_id = get_project_id()
+    wf_steps = [_workflows.WorkflowStep(**s) for s in steps]
+    wf_id = _workflows.save_workflow(
+        project_id, name, wf_steps,
+        description=description,
+        stop_on_failure=stop_on_failure,
+    )
+    return {"workflow_id": wf_id, "name": name, "steps": len(wf_steps)}
+
+
+def run_workflow_tool(name, params=None):
+    """
+    Run a saved workflow by name, substituting any {placeholders} in
+    step prompts with the values in `params`. Returns a summary of each
+    step's outcome (step_name, status, answer, run_id).
+    """
+    project_id = get_project_id()
+    result = _workflows.run_workflow(
+        project_id, name, params=params or {},
+        run_task_fn=run_task,
+    )
+    return result.to_dict()
+
+
+def list_workflows_tool():
+    """
+    List the named workflows defined for this project, with their step
+    counts and descriptions.
+    """
+    project_id = get_project_id()
+    wfs = _workflows.list_workflows(project_id)
+    return [
+        {
+            "name": wf.name,
+            "description": wf.description,
+            "steps": len(wf.steps),
+            "stop_on_failure": wf.stop_on_failure,
+        }
+        for wf in wfs
+    ]
+
+
+def recall_workflow_runs_tool(workflow_name=None, limit=10):
+    """
+    Retrieve past runs of workflows for this project. Optionally filter
+    to a specific workflow_name. Returns run status and per-step outcomes.
+    """
+    project_id = get_project_id()
+    return _workflows.list_workflow_runs(
+        project_id, workflow_name=workflow_name, limit=limit,
+    )
+
+
 def search_files(query):
     matches = []
 
@@ -325,6 +388,66 @@ TOOLS = {
             "type": "object",
             "properties": {
                 "query": {"type": "string"},
+                "limit": {"type": "integer"},
+            },
+        },
+        risk="read",
+        sandboxed=False,
+    ),
+    "save_workflow": ToolSpec(
+        name="save_workflow",
+        func=save_workflow_tool,
+        schema={
+            "type": "object",
+            "properties": {
+                "name": {"type": "string"},
+                "steps": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "name": {"type": "string"},
+                            "prompt_template": {"type": "string"},
+                        },
+                        "required": ["name", "prompt_template"],
+                    },
+                },
+                "description": {"type": "string"},
+                "stop_on_failure": {"type": "boolean"},
+            },
+            "required": ["name", "steps"],
+        },
+        risk="write",
+        sandboxed=False,
+    ),
+    "run_workflow": ToolSpec(
+        name="run_workflow",
+        func=run_workflow_tool,
+        schema={
+            "type": "object",
+            "properties": {
+                "name": {"type": "string"},
+                "params": {"type": "object"},
+            },
+            "required": ["name"],
+        },
+        risk="execute",
+        sandboxed=False,
+    ),
+    "list_workflows": ToolSpec(
+        name="list_workflows",
+        func=list_workflows_tool,
+        schema={"type": "object", "properties": {}},
+        risk="read",
+        sandboxed=False,
+    ),
+    "recall_workflow_runs": ToolSpec(
+        name="recall_workflow_runs",
+        func=recall_workflow_runs_tool,
+        schema={
+            "type": "object",
+            "properties": {
+                "workflow_name": {"type": "string"},
                 "limit": {"type": "integer"},
             },
         },
@@ -645,6 +768,59 @@ Another example:
   "tool": "recall_runs",
   "arguments": {
     "query": "auth"
+  }
+}
+
+save_workflow:
+Define (or update) a named, reusable workflow for this project. A workflow
+is an ordered list of steps; each step has a name and a prompt_template.
+Placeholders in prompt_template like {filename} are filled with values
+from the params dict when the workflow runs. Use stop_on_failure: true to
+halt the workflow if any step does not complete cleanly.
+
+{
+  "tool": "save_workflow",
+  "arguments": {
+    "name": "code-review",
+    "description": "Inspect a file, run its tests, summarise findings",
+    "stop_on_failure": true,
+    "steps": [
+      {"name": "inspect",  "prompt_template": "Read {filename} and list any obvious issues."},
+      {"name": "test",     "prompt_template": "Run the tests for {filename} and report results."},
+      {"name": "summarise","prompt_template": "Summarise the findings from inspecting and testing {filename}."}
+    ]
+  }
+}
+
+run_workflow:
+Execute a saved workflow by name. Pass any placeholder values in params.
+Returns per-step outcomes (step_name, status, answer, run_id).
+
+{
+  "tool": "run_workflow",
+  "arguments": {
+    "name": "code-review",
+    "params": {"filename": "calc.py"}
+  }
+}
+
+list_workflows:
+List all named workflows defined for this project.
+
+{
+  "tool": "list_workflows",
+  "arguments": {}
+}
+
+recall_workflow_runs:
+Retrieve past executions of workflows for this project. Filter to a
+specific workflow with workflow_name.
+
+{
+  "tool": "recall_workflow_runs",
+  "arguments": {
+    "workflow_name": "code-review",
+    "limit": 5
   }
 }
 

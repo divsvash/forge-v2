@@ -12,6 +12,7 @@ import transactions
 import memory
 import workflows as _workflows
 import scheduler as _scheduler
+import modes as _modes
 from run_record import new_run, ToolCallRecord
 
 success_definition = None
@@ -321,6 +322,31 @@ def recall_job_runs_tool(job_id, limit=10):
     """Retrieve the run history for a specific job id."""
     runs = _scheduler.list_job_runs(int(job_id), limit=limit)
     return [r.to_dict() for r in runs]
+
+
+# ---------- MODE TOOLS ----------
+
+def set_mode_tool(mode_id):
+    """
+    Switch Forge's active personality for this project. The mode persists
+    across runs (stored in project memory). Valid mode ids:
+    researcher, planner, coding_agent, mini_divs, intern, growth.
+    """
+    project_id = get_project_id()
+    mode = _modes.set_active_mode(project_id, mode_id)
+    return {
+        "mode": mode.id,
+        "display_name": mode.display_name,
+        "description": mode.description,
+        "default_max_steps": mode.default_max_steps,
+        "tool_access": "all tools" if mode.allowed_tools is None
+                       else f"{len(mode.allowed_tools)} tools (restricted)",
+    }
+
+
+def list_modes_tool():
+    """List all available Forge personalities with their descriptions."""
+    return _modes.list_modes()
 
 
 def search_files(query):
@@ -637,6 +663,26 @@ TOOLS = {
             },
             "required": ["job_id"],
         },
+        risk="read",
+        sandboxed=False,
+    ),
+    "set_mode": ToolSpec(
+        name="set_mode",
+        func=set_mode_tool,
+        schema={
+            "type": "object",
+            "properties": {
+                "mode_id": {"type": "string"},
+            },
+            "required": ["mode_id"],
+        },
+        risk="write",
+        sandboxed=False,
+    ),
+    "list_modes": ToolSpec(
+        name="list_modes",
+        func=list_modes_tool,
+        schema={"type": "object", "properties": {}},
         risk="read",
         sandboxed=False,
     ),
@@ -1063,6 +1109,25 @@ Retrieve the execution history for a specific job_id.
 {
   "tool": "recall_job_runs",
   "arguments": {"job_id": 3, "limit": 5}
+}
+
+list_modes:
+List all available Forge personalities (researcher, planner, coding_agent,
+mini_divs, intern, growth) with their descriptions and tool access.
+
+{
+  "tool": "list_modes",
+  "arguments": {}
+}
+
+set_mode:
+Switch the active personality for this project. Persists across runs.
+Valid mode_id values: researcher, planner, coding_agent, mini_divs,
+intern, growth.
+
+{
+  "tool": "set_mode",
+  "arguments": {"mode_id": "researcher"}
 }
 
 Do not invent files.
@@ -1655,7 +1720,7 @@ INSTRUCTIONS:
 
 # ---------- AGENT LOOP ----------
 
-def run_task(prompt, max_steps=20, max_stalls=3):
+def run_task(prompt, max_steps=None, max_stalls=None):
     """Run one user task. Stop on verified completion, tool budget, or stalled progress."""
     # Each task starts with a clean conversation. The module-level
     # `messages` list used to accumulate across every call to run_task()
@@ -1665,7 +1730,35 @@ def run_task(prompt, max_steps=20, max_stalls=3):
     # all read the module-level `messages`) fixes that while keeping
     # `forge.messages` available for callers/tests that inspect it.
     global messages
-    messages = [_SYSTEM_MESSAGE]
+
+    # --- Mode-aware setup ---
+    # Load the project's active mode (falls back to coding_agent if unset).
+    # Do this before building the system message so we can inject the
+    # mode's system_prompt_prefix and apply its default step/stall limits.
+    try:
+        _project_id_for_mode = get_project_id()
+        active_mode = _modes.get_active_mode(_project_id_for_mode)
+    except Exception:
+        active_mode = _modes.MODES[_modes.DEFAULT_MODE_ID]
+
+    # Caller-supplied values override mode defaults; None means "use mode default".
+    if max_steps is None:
+        max_steps = active_mode.default_max_steps
+    if max_stalls is None:
+        max_stalls = active_mode.default_max_stalls
+
+    # Build a mode-aware system message: mode prefix + shared forge prompt.
+    if active_mode.id != _modes.DEFAULT_MODE_ID or active_mode.system_prompt_prefix:
+        mode_system_content = (
+            active_mode.system_prompt_prefix.rstrip()
+            + "\n\n---\n\n"
+            + _SYSTEM_MESSAGE["content"]
+        )
+        mode_system_msg = {"role": "system", "content": mode_system_content}
+    else:
+        mode_system_msg = _SYSTEM_MESSAGE
+
+    messages = [mode_system_msg]
 
     success_definition = define_success(prompt)
     evidence = {

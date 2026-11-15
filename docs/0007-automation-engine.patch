@@ -1,6 +1,3 @@
-From c7f0b15acbea4813e06892d1bb7ce83be4215df1 Mon Sep 17 00:00:00 2001
-From: Claude <noreply@anthropic.com>
-Date: Sat, 14 Nov 2026 20:36:21 +0000
 Subject: [PATCH] =?UTF-8?q?Phase=2003:=20Automation=20engine=20=E2=80=94?=
  =?UTF-8?q?=20persistent=20job=20scheduler=20with=20retry/backoff?=
 MIME-Version: 1.0

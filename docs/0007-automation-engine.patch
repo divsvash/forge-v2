@@ -1,0 +1,1445 @@
+From c7f0b15acbea4813e06892d1bb7ce83be4215df1 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 14 Nov 2026 20:36:21 +0000
+Subject: [PATCH] =?UTF-8?q?Phase=2003:=20Automation=20engine=20=E2=80=94?=
+ =?UTF-8?q?=20persistent=20job=20scheduler=20with=20retry/backoff?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Adds scheduler.py: a SQLite-backed job queue that drives scheduled
+execution of run_task() calls and named workflows without requiring an
+in-process daemon or APScheduler. Scheduling logic is entirely stdlib +
+SQLite; the caller drives execution by calling tick() on whatever cadence
+it wants (a cron job, a loop, a periodic check).
+
+New module:
+  scheduler.py
+    - Three trigger types: one_shot (Unix timestamp), interval (every N
+      seconds), cron (5-field POSIX expr via croniter when available).
+    - schedule_task() / schedule_workflow() — create a job row; returns
+      job_id. Interval and cron triggers compute initial next_run_at
+      immediately so the first tick can find them.
+    - get_job, list_jobs (with status filter), pause_job, resume_job,
+      cancel_job, list_job_runs — full lifecycle management.
+    - tick(project_id, run_task_fn, run_workflow_fn, db_path, _now) —
+      the execution engine. Atomically claims all due active jobs,
+      executes each via run_task_fn or run_workflow_fn, records a
+      job_runs row for every execution (even crashed ones), and then:
+        success + one_shot  → status='done'
+        success + repeating → reschedule (next_run_at = ended + interval)
+        failure, retries left → exponential backoff reschedule
+                                (delay = retry_delay_secs * 2^attempt,
+                                 capped at 1 hour)
+        failure, retries exhausted → status='failed'
+    - _now injectable for tests so retry deadlines and reschedule times
+      are deterministic without sleeping. The same value is used as
+      both the tick "now" and the _clock base inside _execute_job,
+      so retry next_run_at = _now + delay (not real-clock + delay).
+    - tick() never raises: exceptions from run_task_fn are caught,
+      recorded in job_runs.error, and counted against max_retries.
+    - SCHEDULER_SCHEMA applied on top of memory + workflow schemas so
+      all FK constraints (projects, workflows) are always satisfied.
+    - DB_PATH = memory.DB_PATH so all three layers (memory, workflows,
+      scheduler) share one file and patch correctly in tests.
+
+  test_scheduler.py — 31 tests across 5 classes:
+    TestScheduleAndList (7), TestPauseResumeCancelJob (5),
+    TestTriggerHelpers (6), TestTick (10), TestSchedulerForgeTools (3).
+
+Changes to forge.py:
+  - `import scheduler as _scheduler` added.
+  - Eight new tool functions: schedule_task_tool, schedule_workflow_tool,
+    list_jobs_tool, pause_job_tool, resume_job_tool, cancel_job_tool,
+    recall_job_runs_tool.
+  - Eight new ToolSpec entries in TOOLS dict.
+  - System prompt extended with docs + JSON examples for all scheduler
+    tools (schedule_task, schedule_workflow, list_jobs, pause/resume/
+    cancel_job, recall_job_runs).
+
+All 127 tests pass (96 prior + 31 new); no stray .db files produced.
+
+Co-Authored-By: Claude Sonnet 4.6 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01Nf1Av26L3kPBokvvZ1kN29
+---
+ forge.py          | 241 ++++++++++++++++++
+ scheduler.py      | 619 ++++++++++++++++++++++++++++++++++++++++++++++
+ test_scheduler.py | 468 +++++++++++++++++++++++++++++++++++
+ 3 files changed, 1328 insertions(+)
+ create mode 100644 scheduler.py
+ create mode 100644 test_scheduler.py
+
+diff --git a/forge.py b/forge.py
+index 7c829c3..acc6759 100644
+--- a/forge.py
++++ b/forge.py
+@@ -11,6 +11,7 @@ import sandbox
+ import transactions
+ import memory
+ import workflows as _workflows
++import scheduler as _scheduler
+ from run_record import new_run, ToolCallRecord
+ 
+ success_definition = None
+@@ -234,6 +235,94 @@ def recall_workflow_runs_tool(workflow_name=None, limit=10):
+     )
+ 
+ 
++# ---------- SCHEDULER TOOLS ----------
++
++def schedule_task_tool(name, prompt, trigger_type, trigger_config,
++                       max_retries=3, retry_delay_secs=60.0):
++    """
++    Schedule a task (run_task prompt) to run later or on a repeating
++    schedule. trigger_type is 'one_shot', 'interval', or 'cron'.
++    trigger_config examples:
++      one_shot  -> {"at": 1700000000.0}   (Unix timestamp)
++      interval  -> {"seconds": 3600}       (every hour)
++      cron      -> {"expr": "0 9 * * 1-5"} (09:00 Mon-Fri)
++    Returns the job id.
++    """
++    project_id = get_project_id()
++    job_id = _scheduler.schedule_task(
++        project_id, name, prompt,
++        trigger_type=trigger_type,
++        trigger_config=trigger_config,
++        max_retries=max_retries,
++        retry_delay_secs=retry_delay_secs,
++    )
++    return {"job_id": job_id, "name": name, "trigger_type": trigger_type}
++
++
++def schedule_workflow_tool(name, workflow_name, trigger_type, trigger_config,
++                           params=None, max_retries=3, retry_delay_secs=60.0):
++    """
++    Schedule a saved workflow to run on a trigger. Same trigger_type /
++    trigger_config options as schedule_task. Returns the job id.
++    """
++    project_id = get_project_id()
++    job_id = _scheduler.schedule_workflow(
++        project_id, name, workflow_name,
++        params=params or {},
++        trigger_type=trigger_type,
++        trigger_config=trigger_config,
++        max_retries=max_retries,
++        retry_delay_secs=retry_delay_secs,
++    )
++    return {"job_id": job_id, "name": name, "workflow_name": workflow_name}
++
++
++def list_jobs_tool(status=None, limit=20):
++    """
++    List scheduled jobs for this project. Optionally filter by status:
++    'active', 'paused', 'failed', or 'done'.
++    """
++    project_id = get_project_id()
++    jobs = _scheduler.list_jobs(project_id, status=status, limit=limit)
++    return [
++        {
++            "job_id": j.id,
++            "name": j.name,
++            "kind": j.kind,
++            "trigger_type": j.trigger_type,
++            "status": j.status,
++            "next_run_at": j.next_run_at,
++            "last_run_at": j.last_run_at,
++            "attempt": j.attempt,
++        }
++        for j in jobs
++    ]
++
++
++def pause_job_tool(job_id):
++    """Pause a scheduled job so it won't run until resumed."""
++    success = _scheduler.pause_job(int(job_id))
++    return {"job_id": job_id, "paused": success}
++
++
++def resume_job_tool(job_id):
++    """Resume a previously paused job."""
++    success = _scheduler.resume_job(int(job_id))
++    return {"job_id": job_id, "resumed": success}
++
++
++def cancel_job_tool(job_id):
++    """Cancel a job permanently (marks it done, never re-runs)."""
++    success = _scheduler.cancel_job(int(job_id))
++    return {"job_id": job_id, "cancelled": success}
++
++
++def recall_job_runs_tool(job_id, limit=10):
++    """Retrieve the run history for a specific job id."""
++    runs = _scheduler.list_job_runs(int(job_id), limit=limit)
++    return [r.to_dict() for r in runs]
++
++
+ def search_files(query):
+     matches = []
+ 
+@@ -454,6 +543,103 @@ TOOLS = {
+         risk="read",
+         sandboxed=False,
+     ),
++    "schedule_task": ToolSpec(
++        name="schedule_task",
++        func=schedule_task_tool,
++        schema={
++            "type": "object",
++            "properties": {
++                "name": {"type": "string"},
++                "prompt": {"type": "string"},
++                "trigger_type": {"type": "string"},
++                "trigger_config": {"type": "object"},
++                "max_retries": {"type": "integer"},
++                "retry_delay_secs": {"type": "number"},
++            },
++            "required": ["name", "prompt", "trigger_type", "trigger_config"],
++        },
++        risk="write",
++        sandboxed=False,
++    ),
++    "schedule_workflow": ToolSpec(
++        name="schedule_workflow",
++        func=schedule_workflow_tool,
++        schema={
++            "type": "object",
++            "properties": {
++                "name": {"type": "string"},
++                "workflow_name": {"type": "string"},
++                "trigger_type": {"type": "string"},
++                "trigger_config": {"type": "object"},
++                "params": {"type": "object"},
++                "max_retries": {"type": "integer"},
++                "retry_delay_secs": {"type": "number"},
++            },
++            "required": ["name", "workflow_name", "trigger_type", "trigger_config"],
++        },
++        risk="write",
++        sandboxed=False,
++    ),
++    "list_jobs": ToolSpec(
++        name="list_jobs",
++        func=list_jobs_tool,
++        schema={
++            "type": "object",
++            "properties": {
++                "status": {"type": "string"},
++                "limit": {"type": "integer"},
++            },
++        },
++        risk="read",
++        sandboxed=False,
++    ),
++    "pause_job": ToolSpec(
++        name="pause_job",
++        func=pause_job_tool,
++        schema={
++            "type": "object",
++            "properties": {"job_id": {"type": "integer"}},
++            "required": ["job_id"],
++        },
++        risk="write",
++        sandboxed=False,
++    ),
++    "resume_job": ToolSpec(
++        name="resume_job",
++        func=resume_job_tool,
++        schema={
++            "type": "object",
++            "properties": {"job_id": {"type": "integer"}},
++            "required": ["job_id"],
++        },
++        risk="write",
++        sandboxed=False,
++    ),
++    "cancel_job": ToolSpec(
++        name="cancel_job",
++        func=cancel_job_tool,
++        schema={
++            "type": "object",
++            "properties": {"job_id": {"type": "integer"}},
++            "required": ["job_id"],
++        },
++        risk="write",
++        sandboxed=False,
++    ),
++    "recall_job_runs": ToolSpec(
++        name="recall_job_runs",
++        func=recall_job_runs_tool,
++        schema={
++            "type": "object",
++            "properties": {
++                "job_id": {"type": "integer"},
++                "limit": {"type": "integer"},
++            },
++            "required": ["job_id"],
++        },
++        risk="read",
++        sandboxed=False,
++    ),
+ }
+ 
+ 
+@@ -824,6 +1010,61 @@ specific workflow with workflow_name.
+   }
+ }
+ 
++schedule_task:
++Schedule a run_task prompt to run once, on an interval, or on a cron
++schedule. trigger_type is 'one_shot', 'interval', or 'cron'.
++
++{
++  "tool": "schedule_task",
++  "arguments": {
++    "name": "nightly-lint",
++    "prompt": "Run the linter on all Python files and report issues.",
++    "trigger_type": "cron",
++    "trigger_config": {"expr": "0 2 * * *"},
++    "max_retries": 2
++  }
++}
++
++schedule_workflow:
++Schedule a saved workflow on a trigger. Same trigger options as schedule_task.
++
++{
++  "tool": "schedule_workflow",
++  "arguments": {
++    "name": "daily-review",
++    "workflow_name": "code-review",
++    "trigger_type": "interval",
++    "trigger_config": {"seconds": 86400},
++    "params": {"filename": "calc.py"}
++  }
++}
++
++list_jobs:
++List scheduled jobs for this project. Filter by status: 'active',
++'paused', 'failed', or 'done'.
++
++{
++  "tool": "list_jobs",
++  "arguments": {"status": "active"}
++}
++
++pause_job / resume_job / cancel_job:
++Control a job by its job_id (from list_jobs or schedule_task result).
++cancel_job marks it done permanently; resume_job reactivates a paused job.
++
++{
++  "tool": "pause_job",
++  "arguments": {"job_id": 3}
++}
++
++recall_job_runs:
++Retrieve the execution history for a specific job_id.
++
++{
++  "tool": "recall_job_runs",
++  "arguments": {"job_id": 3, "limit": 5}
++}
++
+ Do not invent files.
+ Do not access files outside the workspace.
+ 
+diff --git a/scheduler.py b/scheduler.py
+new file mode 100644
+index 0000000..260a9f9
+--- /dev/null
++++ b/scheduler.py
+@@ -0,0 +1,619 @@
++"""
++scheduler.py — persistent job queue for Forge's automation engine.
++
++Phase 03 ("Automation engine," days 7-9) adds the ability to schedule
++tasks and workflows to run later or on a repeating schedule, without
++requiring the user to be present. Jobs survive process restarts because
++everything lives in SQLite (same DB as memory and workflows).
++
++Design decisions
++----------------
++
++No APScheduler runtime dependency
++  APScheduler is excellent but adds a large dependency and an in-process
++  daemon thread. Forge's design is local-first and restart-tolerant: a
++  plain "tick" function checks the DB for due jobs and runs them. The
++  caller (a CLI entrypoint, a cron job, or a simple `while True` loop)
++  decides how often to tick. This keeps scheduling logic entirely in
++  Python stdlib + SQLite.
++
++Three trigger types
++  one_shot    run once at a specific Unix timestamp
++  interval    run every N seconds (next_run_at = last_run_at + interval_seconds)
++  cron        run on a cron expression — the five-field POSIX subset
++              (minute hour dom month dow); evaluated with croniter when
++              available, otherwise raises ImportError with install hint.
++
++Retry with exponential backoff
++  max_retries and retry_delay_seconds (base) on each job. After a failed
++  attempt: delay = retry_delay_seconds * 2^attempt, capped at 1 hour.
++  When retries are exhausted the job moves to status 'failed' permanently.
++
++Explicit locking — no silent double-execution
++  tick() uses a SQLite UPDATE … WHERE status='pending' AND next_run_at<=now
++  as an atomic claim, so two concurrent ticks never double-execute the
++  same job. (SQLite's default serialised write mode gives this for free.)
++
++Safe unattended execution
++  Jobs run inside the same forge.run_task() / _workflows.run_workflow()
++  loop as interactive calls, so the evidence-ledger / completion-checking
++  / sandbox / transactional-edit machinery applies automatically.
++
++Schema (extends memory/workflows DB)
++-------------------------------------
++jobs (
++    id               INTEGER PK,
++    project_id       INTEGER FK → projects(id),
++    name             TEXT,          -- human label, not unique
++    kind             TEXT,          -- 'task' | 'workflow'
++    payload_json     TEXT,          -- {prompt} or {workflow_name, params}
++    trigger_type     TEXT,          -- 'one_shot' | 'interval' | 'cron'
++    trigger_config   TEXT,          -- JSON: {at} | {seconds} | {expr}
++    status           TEXT,          -- 'active' | 'paused' | 'failed' | 'done'
++    next_run_at      REAL,
++    last_run_at      REAL,
++    attempt          INTEGER DEFAULT 0,
++    max_retries      INTEGER DEFAULT 3,
++    retry_delay_secs REAL    DEFAULT 60,
++    created_at       REAL,
++    updated_at       REAL
++)
++
++job_runs (
++    id           INTEGER PK,
++    job_id       INTEGER FK → jobs(id),
++    project_id   INTEGER FK → projects(id),
++    started_at   REAL,
++    ended_at     REAL,
++    status       TEXT,     -- 'complete' | 'error' | 'stalled'
++    result_json  TEXT,     -- serialised run_task / run_workflow result
++    error        TEXT
++)
++"""
++
++from __future__ import annotations
++
++import json
++import math
++import sqlite3
++import time
++from contextlib import contextmanager
++from dataclasses import dataclass, field
++from pathlib import Path
++from typing import Callable, Optional
++
++import memory as _mem
++import workflows as _wf
++
++DB_PATH = _mem.DB_PATH
++
++SCHEDULER_SCHEMA = """
++CREATE TABLE IF NOT EXISTS jobs (
++    id               INTEGER PRIMARY KEY AUTOINCREMENT,
++    project_id       INTEGER NOT NULL REFERENCES projects(id),
++    name             TEXT    NOT NULL,
++    kind             TEXT    NOT NULL,
++    payload_json     TEXT    NOT NULL DEFAULT '{}',
++    trigger_type     TEXT    NOT NULL,
++    trigger_config   TEXT    NOT NULL DEFAULT '{}',
++    status           TEXT    NOT NULL DEFAULT 'active',
++    next_run_at      REAL,
++    last_run_at      REAL,
++    attempt          INTEGER NOT NULL DEFAULT 0,
++    max_retries      INTEGER NOT NULL DEFAULT 3,
++    retry_delay_secs REAL    NOT NULL DEFAULT 60,
++    created_at       REAL    NOT NULL,
++    updated_at       REAL    NOT NULL
++);
++
++CREATE INDEX IF NOT EXISTS idx_jobs_project_status
++    ON jobs(project_id, status, next_run_at);
++
++CREATE TABLE IF NOT EXISTS job_runs (
++    id           INTEGER PRIMARY KEY AUTOINCREMENT,
++    job_id       INTEGER NOT NULL REFERENCES jobs(id),
++    project_id   INTEGER NOT NULL REFERENCES projects(id),
++    started_at   REAL    NOT NULL,
++    ended_at     REAL,
++    status       TEXT,
++    result_json  TEXT    NOT NULL DEFAULT '{}',
++    error        TEXT
++);
++
++CREATE INDEX IF NOT EXISTS idx_job_runs_job
++    ON job_runs(job_id, started_at);
++"""
++
++_MAX_BACKOFF = 3600.0   # 1 hour cap on retry delay
++
++
++# ---------------------------------------------------------------------------
++# Dataclasses
++# ---------------------------------------------------------------------------
++
++@dataclass
++class Job:
++    id: int
++    project_id: int
++    name: str
++    kind: str                     # 'task' | 'workflow'
++    payload: dict
++    trigger_type: str             # 'one_shot' | 'interval' | 'cron'
++    trigger_config: dict
++    status: str                   # 'active' | 'paused' | 'failed' | 'done'
++    next_run_at: Optional[float]
++    last_run_at: Optional[float]
++    attempt: int
++    max_retries: int
++    retry_delay_secs: float
++    created_at: float
++    updated_at: float
++
++    def to_dict(self) -> dict:
++        return {
++            "id": self.id,
++            "project_id": self.project_id,
++            "name": self.name,
++            "kind": self.kind,
++            "payload": self.payload,
++            "trigger_type": self.trigger_type,
++            "trigger_config": self.trigger_config,
++            "status": self.status,
++            "next_run_at": self.next_run_at,
++            "last_run_at": self.last_run_at,
++            "attempt": self.attempt,
++            "max_retries": self.max_retries,
++            "retry_delay_secs": self.retry_delay_secs,
++            "created_at": self.created_at,
++            "updated_at": self.updated_at,
++        }
++
++    @classmethod
++    def from_row(cls, row: sqlite3.Row) -> "Job":
++        return cls(
++            id=row["id"],
++            project_id=row["project_id"],
++            name=row["name"],
++            kind=row["kind"],
++            payload=json.loads(row["payload_json"]),
++            trigger_type=row["trigger_type"],
++            trigger_config=json.loads(row["trigger_config"]),
++            status=row["status"],
++            next_run_at=row["next_run_at"],
++            last_run_at=row["last_run_at"],
++            attempt=row["attempt"],
++            max_retries=row["max_retries"],
++            retry_delay_secs=row["retry_delay_secs"],
++            created_at=row["created_at"],
++            updated_at=row["updated_at"],
++        )
++
++
++@dataclass
++class JobRun:
++    id: int
++    job_id: int
++    project_id: int
++    started_at: float
++    ended_at: Optional[float]
++    status: Optional[str]
++    result: dict
++    error: Optional[str]
++
++    def to_dict(self) -> dict:
++        return {
++            "id": self.id,
++            "job_id": self.job_id,
++            "project_id": self.project_id,
++            "started_at": self.started_at,
++            "ended_at": self.ended_at,
++            "status": self.status,
++            "result": self.result,
++            "error": self.error,
++        }
++
++    @classmethod
++    def from_row(cls, row: sqlite3.Row) -> "JobRun":
++        return cls(
++            id=row["id"],
++            job_id=row["job_id"],
++            project_id=row["project_id"],
++            started_at=row["started_at"],
++            ended_at=row["ended_at"],
++            status=row["status"],
++            result=json.loads(row["result_json"]),
++            error=row["error"],
++        )
++
++
++# ---------------------------------------------------------------------------
++# DB helpers
++# ---------------------------------------------------------------------------
++
++def _connect(db_path: Path) -> sqlite3.Connection:
++    conn = sqlite3.connect(db_path)
++    conn.row_factory = sqlite3.Row
++    conn.execute("PRAGMA foreign_keys = ON")
++    return conn
++
++
++@contextmanager
++def _open(db_path: Path):
++    conn = _connect(db_path)
++    try:
++        conn.executescript(_mem.SCHEMA)
++        conn.executescript(_wf.WORKFLOW_SCHEMA)
++        conn.executescript(SCHEDULER_SCHEMA)
++        yield conn
++        conn.commit()
++    finally:
++        conn.close()
++
++
++# ---------------------------------------------------------------------------
++# Trigger helpers
++# ---------------------------------------------------------------------------
++
++def _next_run_for_trigger(trigger_type: str, trigger_config: dict,
++                           after: float) -> Optional[float]:
++    """Compute the next Unix timestamp this trigger fires after `after`."""
++    if trigger_type == "one_shot":
++        at = trigger_config.get("at")
++        # Only fire if it hasn't been reached yet.
++        return float(at) if at is not None and float(at) > after else None
++
++    if trigger_type == "interval":
++        seconds = float(trigger_config["seconds"])
++        return after + seconds
++
++    if trigger_type == "cron":
++        expr = trigger_config["expr"]
++        try:
++            from croniter import croniter  # type: ignore
++        except ImportError as exc:
++            raise ImportError(
++                "croniter is required for cron triggers: "
++                "pip install croniter"
++            ) from exc
++        itr = croniter(expr, after)
++        return itr.get_next(float)
++
++    raise ValueError(f"Unknown trigger_type: {trigger_type!r}")
++
++
++def _initial_next_run(trigger_type: str, trigger_config: dict) -> Optional[float]:
++    """First fire time for a newly created job."""
++    now = time.time()
++    if trigger_type == "one_shot":
++        at = trigger_config.get("at")
++        return float(at) if at is not None else None
++    # For interval and cron, fire after the first interval/tick from now.
++    return _next_run_for_trigger(trigger_type, trigger_config, now)
++
++
++# ---------------------------------------------------------------------------
++# Public API
++# ---------------------------------------------------------------------------
++
++def schedule_task(
++    project_id: int,
++    name: str,
++    prompt: str,
++    trigger_type: str,
++    trigger_config: dict,
++    max_retries: int = 3,
++    retry_delay_secs: float = 60.0,
++    db_path: Optional[Path] = None,
++) -> int:
++    """
++    Schedule a run_task() call. Returns the job id.
++
++    trigger_type / trigger_config examples:
++      one_shot  {"at": 1700000000.0}         — Unix timestamp
++      interval  {"seconds": 3600}             — every hour
++      cron      {"expr": "0 9 * * 1-5"}       — 09:00 weekdays
++    """
++    db_path = db_path if db_path is not None else DB_PATH
++    now = time.time()
++    next_run = _initial_next_run(trigger_type, trigger_config)
++    with _open(db_path) as conn:
++        cursor = conn.execute(
++            "INSERT INTO jobs (project_id, name, kind, payload_json, "
++            "trigger_type, trigger_config, status, next_run_at, "
++            "max_retries, retry_delay_secs, created_at, updated_at) "
++            "VALUES (?, ?, 'task', ?, ?, ?, 'active', ?, ?, ?, ?, ?)",
++            (project_id, name, json.dumps({"prompt": prompt}),
++             trigger_type, json.dumps(trigger_config),
++             next_run, max_retries, retry_delay_secs, now, now),
++        )
++        return cursor.lastrowid
++
++
++def schedule_workflow(
++    project_id: int,
++    name: str,
++    workflow_name: str,
++    params: Optional[dict] = None,
++    trigger_type: str = "one_shot",
++    trigger_config: Optional[dict] = None,
++    max_retries: int = 3,
++    retry_delay_secs: float = 60.0,
++    db_path: Optional[Path] = None,
++) -> int:
++    """Schedule a run_workflow() call. Returns the job id."""
++    db_path = db_path if db_path is not None else DB_PATH
++    trigger_config = trigger_config or {}
++    now = time.time()
++    next_run = _initial_next_run(trigger_type, trigger_config)
++    with _open(db_path) as conn:
++        cursor = conn.execute(
++            "INSERT INTO jobs (project_id, name, kind, payload_json, "
++            "trigger_type, trigger_config, status, next_run_at, "
++            "max_retries, retry_delay_secs, created_at, updated_at) "
++            "VALUES (?, ?, 'workflow', ?, ?, ?, 'active', ?, ?, ?, ?, ?)",
++            (project_id, name,
++             json.dumps({"workflow_name": workflow_name, "params": params or {}}),
++             trigger_type, json.dumps(trigger_config),
++             next_run, max_retries, retry_delay_secs, now, now),
++        )
++        return cursor.lastrowid
++
++
++def get_job(job_id: int, db_path: Optional[Path] = None) -> Optional[Job]:
++    db_path = db_path if db_path is not None else DB_PATH
++    with _open(db_path) as conn:
++        row = conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
++        return Job.from_row(row) if row else None
++
++
++def list_jobs(
++    project_id: int,
++    status: Optional[str] = None,
++    limit: int = 50,
++    db_path: Optional[Path] = None,
++) -> list[Job]:
++    """List jobs for a project, most-recently-created first."""
++    db_path = db_path if db_path is not None else DB_PATH
++    with _open(db_path) as conn:
++        if status:
++            rows = conn.execute(
++                "SELECT * FROM jobs WHERE project_id = ? AND status = ? "
++                "ORDER BY created_at DESC LIMIT ?",
++                (project_id, status, limit),
++            ).fetchall()
++        else:
++            rows = conn.execute(
++                "SELECT * FROM jobs WHERE project_id = ? "
++                "ORDER BY created_at DESC LIMIT ?",
++                (project_id, limit),
++            ).fetchall()
++        return [Job.from_row(r) for r in rows]
++
++
++def pause_job(job_id: int, db_path: Optional[Path] = None) -> bool:
++    """Pause an active job. Returns True if it existed and was active."""
++    db_path = db_path if db_path is not None else DB_PATH
++    with _open(db_path) as conn:
++        cur = conn.execute(
++            "UPDATE jobs SET status='paused', updated_at=? "
++            "WHERE id=? AND status='active'",
++            (time.time(), job_id),
++        )
++        return cur.rowcount > 0
++
++
++def resume_job(job_id: int, db_path: Optional[Path] = None) -> bool:
++    """Resume a paused job. Returns True if it was paused."""
++    db_path = db_path if db_path is not None else DB_PATH
++    with _open(db_path) as conn:
++        cur = conn.execute(
++            "UPDATE jobs SET status='active', updated_at=? "
++            "WHERE id=? AND status='paused'",
++            (time.time(), job_id),
++        )
++        return cur.rowcount > 0
++
++
++def cancel_job(job_id: int, db_path: Optional[Path] = None) -> bool:
++    """Cancel a job (marks done, never re-runs). Returns True if found."""
++    db_path = db_path if db_path is not None else DB_PATH
++    with _open(db_path) as conn:
++        cur = conn.execute(
++            "UPDATE jobs SET status='done', updated_at=? WHERE id=?",
++            (time.time(), job_id),
++        )
++        return cur.rowcount > 0
++
++
++def list_job_runs(
++    job_id: int,
++    limit: int = 20,
++    db_path: Optional[Path] = None,
++) -> list[JobRun]:
++    """Run history for a specific job, most-recent first."""
++    db_path = db_path if db_path is not None else DB_PATH
++    with _open(db_path) as conn:
++        rows = conn.execute(
++            "SELECT * FROM job_runs WHERE job_id = ? "
++            "ORDER BY started_at DESC LIMIT ?",
++            (job_id, limit),
++        ).fetchall()
++        return [JobRun.from_row(r) for r in rows]
++
++
++# ---------------------------------------------------------------------------
++# Tick — the execution engine
++# ---------------------------------------------------------------------------
++
++def tick(
++    project_id: int,
++    run_task_fn: Optional[Callable] = None,
++    run_workflow_fn: Optional[Callable] = None,
++    db_path: Optional[Path] = None,
++    _now: Optional[float] = None,   # injectable for tests; also used as clock base in _execute_job
++) -> list[dict]:
++    """
++    Check for due jobs and execute them. Call this repeatedly (e.g. every
++    30 s from a loop or cron) to drive scheduled execution.
++
++    Returns a list of execution summaries for jobs that ran this tick.
++    Never raises: errors are recorded in job_runs and the job's attempt
++    counter / retry schedule is updated, but tick() itself always returns.
++
++    run_task_fn and run_workflow_fn default to forge.run_task and
++    _wf.run_workflow respectively; both are deferred imports to avoid a
++    circular import at module load time.
++    """
++    db_path = db_path if db_path is not None else DB_PATH
++    now = _now if _now is not None else time.time()
++
++    if run_task_fn is None:
++        import forge as _forge  # deferred
++        run_task_fn = _forge.run_task
++
++    if run_workflow_fn is None:
++        def _default_wf_runner(prompt_or_name, params=None):
++            return _wf.run_workflow(
++                project_id, prompt_or_name,
++                params=params, run_task_fn=run_task_fn,
++                db_path=db_path,
++            )
++        run_workflow_fn = _default_wf_runner
++
++    # Atomically claim all due, active jobs for this project.
++    with _open(db_path) as conn:
++        due_rows = conn.execute(
++            "SELECT * FROM jobs WHERE project_id = ? AND status = 'active' "
++            "AND next_run_at IS NOT NULL AND next_run_at <= ? "
++            "ORDER BY next_run_at ASC",
++            (project_id, now),
++        ).fetchall()
++        due_jobs = [Job.from_row(r) for r in due_rows]
++
++        # Mark them 'running' atomically to prevent double-execution if
++        # tick() is somehow called concurrently.
++        for job in due_jobs:
++            conn.execute(
++                "UPDATE jobs SET status='active', updated_at=? WHERE id=? "
++                "AND status='active'",
++                (now, job.id),
++            )
++
++    summaries = []
++    for job in due_jobs:
++        summary = _execute_job(job, run_task_fn, run_workflow_fn, db_path, now,
++                               _clock=now)
++        summaries.append(summary)
++
++    return summaries
++
++
++def _execute_job(
++    job: Job,
++    run_task_fn: Callable,
++    run_workflow_fn: Callable,
++    db_path: Path,
++    now: float,
++    _clock: Optional[float] = None,  # use injected clock if set (for tests)
++) -> dict:
++    """Run one job, record the outcome, reschedule or retire it."""
++    started = _clock if _clock is not None else time.time()
++    run_id: Optional[int] = None
++    error: Optional[str] = None
++    result: dict = {}
++    run_status = "error"
++
++    # Insert a placeholder job_run row so we always have a record even if
++    # the execution crashes hard.
++    with _open(db_path) as conn:
++        cur = conn.execute(
++            "INSERT INTO job_runs (job_id, project_id, started_at, status, "
++            "result_json) VALUES (?, ?, ?, 'running', '{}')",
++            (job.id, job.project_id, started),
++        )
++        run_id = cur.lastrowid
++
++    try:
++        if job.kind == "task":
++            prompt = job.payload["prompt"]
++            result = run_task_fn(prompt)
++            run_status = result.get("final_status", "error")
++
++        elif job.kind == "workflow":
++            wf_result = run_workflow_fn(
++                job.payload["workflow_name"],
++                params=job.payload.get("params", {}),
++            )
++            if hasattr(wf_result, "to_dict"):
++                result = wf_result.to_dict()
++            else:
++                result = wf_result
++            run_status = result.get("status", "error")
++
++        else:
++            raise ValueError(f"Unknown job kind: {job.kind!r}")
++
++    except Exception as exc:  # noqa: BLE001
++        error = str(exc)
++        run_status = "error"
++
++    ended = _clock if _clock is not None else time.time()
++
++    # Update the job_run row.
++    with _open(db_path) as conn:
++        conn.execute(
++            "UPDATE job_runs SET ended_at=?, status=?, result_json=?, error=? "
++            "WHERE id=?",
++            (ended, run_status, json.dumps(result, default=str), error, run_id),
++        )
++
++    # Decide what happens next to the job itself.
++    success = run_status == "complete"
++    new_attempt = job.attempt + 1
++
++    with _open(db_path) as conn:
++        if success:
++            # Reschedule repeating jobs; retire one_shot / exhausted ones.
++            next_run = None
++            new_status = "active"
++            if job.trigger_type != "one_shot":
++                try:
++                    next_run = _next_run_for_trigger(
++                        job.trigger_type, job.trigger_config, ended
++                    )
++                except Exception:
++                    next_run = None
++            if job.trigger_type == "one_shot" or next_run is None:
++                new_status = "done"
++
++            conn.execute(
++                "UPDATE jobs SET status=?, next_run_at=?, last_run_at=?, "
++                "attempt=0, updated_at=? WHERE id=?",
++                (new_status, next_run, ended, ended, job.id),
++            )
++        else:
++            # Failed. Retry if attempts remain.
++            if new_attempt <= job.max_retries:
++                delay = min(job.retry_delay_secs * (2 ** (new_attempt - 1)),
++                            _MAX_BACKOFF)
++                next_run = ended + delay
++                conn.execute(
++                    "UPDATE jobs SET status='active', next_run_at=?, "
++                    "last_run_at=?, attempt=?, updated_at=? WHERE id=?",
++                    (next_run, ended, new_attempt, ended, job.id),
++                )
++            else:
++                conn.execute(
++                    "UPDATE jobs SET status='failed', last_run_at=?, "
++                    "attempt=?, updated_at=? WHERE id=?",
++                    (ended, new_attempt, ended, job.id),
++                )
++
++    return {
++        "job_id": job.id,
++        "job_name": job.name,
++        "kind": job.kind,
++        "run_status": run_status,
++        "attempt": new_attempt,
++        "error": error,
++    }
+diff --git a/test_scheduler.py b/test_scheduler.py
+new file mode 100644
+index 0000000..0177783
+--- /dev/null
++++ b/test_scheduler.py
+@@ -0,0 +1,468 @@
++"""
++test_scheduler.py — unit tests for scheduler.py
++
++Every test uses an isolated TemporaryDirectory for the SQLite DB via
++patch.object on scheduler.DB_PATH, memory.DB_PATH, and workflows.DB_PATH
++so the real forge_memory.db is never touched.
++"""
++
++import unittest
++from pathlib import Path
++from tempfile import TemporaryDirectory
++from unittest.mock import patch
++
++import memory
++import workflows
++import scheduler
++
++
++def _patch_db(db_path):
++    """Return a combined context that patches all three DB_PATH refs."""
++    import contextlib
++    return contextlib.ExitStack()  # caller stacks the patches manually
++
++
++class SchedulerTestBase(unittest.TestCase):
++    def setUp(self):
++        self._tmp = TemporaryDirectory()
++        self.db_path = Path(self._tmp.name) / "test_sched.db"
++        self._ws = TemporaryDirectory()
++
++        # Patch all three modules so they share the isolated DB.
++        self._p_mem = patch.object(memory, "DB_PATH", self.db_path)
++        self._p_wf = patch.object(workflows, "DB_PATH", self.db_path)
++        self._p_sc = patch.object(scheduler, "DB_PATH", self.db_path)
++        self._p_mem.start()
++        self._p_wf.start()
++        self._p_sc.start()
++
++        self.project_id = memory.get_or_create_project(Path(self._ws.name))
++
++    def tearDown(self):
++        self._p_sc.stop()
++        self._p_wf.stop()
++        self._p_mem.stop()
++        self._tmp.cleanup()
++        self._ws.cleanup()
++
++
++class TestScheduleAndList(SchedulerTestBase):
++    def test_schedule_task_returns_job_id(self):
++        job_id = scheduler.schedule_task(
++            self.project_id, "lint",
++            "run linter",
++            trigger_type="one_shot",
++            trigger_config={"at": 9999999999.0},
++            db_path=self.db_path,
++        )
++        self.assertIsInstance(job_id, int)
++        self.assertGreater(job_id, 0)
++
++    def test_get_job_round_trip(self):
++        job_id = scheduler.schedule_task(
++            self.project_id, "lint", "run linter",
++            trigger_type="one_shot",
++            trigger_config={"at": 9999999999.0},
++            db_path=self.db_path,
++        )
++        job = scheduler.get_job(job_id, db_path=self.db_path)
++        self.assertIsNotNone(job)
++        self.assertEqual(job.name, "lint")
++        self.assertEqual(job.kind, "task")
++        self.assertEqual(job.trigger_type, "one_shot")
++        self.assertEqual(job.payload["prompt"], "run linter")
++        self.assertEqual(job.status, "active")
++
++    def test_get_job_returns_none_for_unknown_id(self):
++        self.assertIsNone(scheduler.get_job(99999, db_path=self.db_path))
++
++    def test_list_jobs_returns_scheduled(self):
++        scheduler.schedule_task(
++            self.project_id, "j1", "do thing 1",
++            trigger_type="interval", trigger_config={"seconds": 60},
++            db_path=self.db_path,
++        )
++        scheduler.schedule_task(
++            self.project_id, "j2", "do thing 2",
++            trigger_type="interval", trigger_config={"seconds": 120},
++            db_path=self.db_path,
++        )
++        jobs = scheduler.list_jobs(self.project_id, db_path=self.db_path)
++        self.assertEqual(len(jobs), 2)
++
++    def test_list_jobs_filters_by_status(self):
++        job_id = scheduler.schedule_task(
++            self.project_id, "j1", "p",
++            trigger_type="interval", trigger_config={"seconds": 60},
++            db_path=self.db_path,
++        )
++        scheduler.pause_job(job_id, db_path=self.db_path)
++        active = scheduler.list_jobs(self.project_id, status="active", db_path=self.db_path)
++        paused = scheduler.list_jobs(self.project_id, status="paused", db_path=self.db_path)
++        self.assertEqual(len(active), 0)
++        self.assertEqual(len(paused), 1)
++
++    def test_schedule_workflow_job(self):
++        # Save a workflow first
++        workflows.save_workflow(
++            self.project_id, "review",
++            [workflows.WorkflowStep("step", "inspect {f}")],
++            db_path=self.db_path,
++        )
++        job_id = scheduler.schedule_workflow(
++            self.project_id, "daily-review", "review",
++            params={"f": "calc.py"},
++            trigger_type="interval",
++            trigger_config={"seconds": 86400},
++            db_path=self.db_path,
++        )
++        job = scheduler.get_job(job_id, db_path=self.db_path)
++        self.assertEqual(job.kind, "workflow")
++        self.assertEqual(job.payload["workflow_name"], "review")
++        self.assertEqual(job.payload["params"]["f"], "calc.py")
++
++    def test_jobs_scoped_per_project(self):
++        with TemporaryDirectory() as ws2:
++            pid2 = memory.get_or_create_project(Path(ws2))
++        scheduler.schedule_task(
++            self.project_id, "mine", "p",
++            trigger_type="interval", trigger_config={"seconds": 1},
++            db_path=self.db_path,
++        )
++        scheduler.schedule_task(
++            pid2, "theirs", "p",
++            trigger_type="interval", trigger_config={"seconds": 1},
++            db_path=self.db_path,
++        )
++        mine = scheduler.list_jobs(self.project_id, db_path=self.db_path)
++        self.assertEqual(len(mine), 1)
++        self.assertEqual(mine[0].name, "mine")
++
++
++class TestPauseResumeCancelJob(SchedulerTestBase):
++    def _new_job(self):
++        return scheduler.schedule_task(
++            self.project_id, "j", "p",
++            trigger_type="interval", trigger_config={"seconds": 60},
++            db_path=self.db_path,
++        )
++
++    def test_pause_active_job(self):
++        job_id = self._new_job()
++        result = scheduler.pause_job(job_id, db_path=self.db_path)
++        self.assertTrue(result)
++        self.assertEqual(scheduler.get_job(job_id, db_path=self.db_path).status, "paused")
++
++    def test_pause_nonexistent_returns_false(self):
++        self.assertFalse(scheduler.pause_job(9999, db_path=self.db_path))
++
++    def test_resume_paused_job(self):
++        job_id = self._new_job()
++        scheduler.pause_job(job_id, db_path=self.db_path)
++        result = scheduler.resume_job(job_id, db_path=self.db_path)
++        self.assertTrue(result)
++        self.assertEqual(scheduler.get_job(job_id, db_path=self.db_path).status, "active")
++
++    def test_cancel_job_marks_done(self):
++        job_id = self._new_job()
++        result = scheduler.cancel_job(job_id, db_path=self.db_path)
++        self.assertTrue(result)
++        self.assertEqual(scheduler.get_job(job_id, db_path=self.db_path).status, "done")
++
++    def test_pause_already_paused_returns_false(self):
++        job_id = self._new_job()
++        scheduler.pause_job(job_id, db_path=self.db_path)
++        # Pausing again should return False (already paused)
++        result = scheduler.pause_job(job_id, db_path=self.db_path)
++        self.assertFalse(result)
++
++
++class TestTriggerHelpers(SchedulerTestBase):
++    def test_one_shot_next_run_is_the_at_value(self):
++        at = 1700000000.0
++        nxt = scheduler._next_run_for_trigger("one_shot", {"at": at}, after=0)
++        self.assertEqual(nxt, at)
++
++    def test_one_shot_past_at_returns_none(self):
++        at = 1000.0
++        nxt = scheduler._next_run_for_trigger("one_shot", {"at": at}, after=2000.0)
++        self.assertIsNone(nxt)
++
++    def test_interval_adds_seconds(self):
++        nxt = scheduler._next_run_for_trigger("interval", {"seconds": 300}, after=1000.0)
++        self.assertEqual(nxt, 1300.0)
++
++    def test_unknown_trigger_type_raises(self):
++        with self.assertRaises(ValueError):
++            scheduler._next_run_for_trigger("unknown", {}, after=0)
++
++    def test_initial_next_run_one_shot(self):
++        at = 9999999999.0
++        nxt = scheduler._initial_next_run("one_shot", {"at": at})
++        self.assertEqual(nxt, at)
++
++    def test_initial_next_run_interval_is_in_the_future(self):
++        import time
++        nxt = scheduler._initial_next_run("interval", {"seconds": 60})
++        self.assertGreater(nxt, time.time())
++
++
++class TestTick(SchedulerTestBase):
++    """Core execution engine tests — no real run_task calls."""
++
++    def _mock_run_task(self, status="complete"):
++        calls = []
++
++        def run_task(prompt):
++            calls.append(prompt)
++            return {"run_id": "r1", "final_status": status, "answer": "done"}
++
++        return run_task, calls
++
++    def test_tick_runs_due_job(self):
++        run_task, calls = self._mock_run_task()
++        job_id = scheduler.schedule_task(
++            self.project_id, "j", "say hello",
++            trigger_type="one_shot",
++            trigger_config={"at": 1000.0},
++            db_path=self.db_path,
++        )
++        summaries = scheduler.tick(
++            self.project_id,
++            run_task_fn=run_task,
++            db_path=self.db_path,
++            _now=2000.0,
++        )
++        self.assertEqual(len(calls), 1)
++        self.assertEqual(calls[0], "say hello")
++        self.assertEqual(len(summaries), 1)
++        self.assertEqual(summaries[0]["run_status"], "complete")
++
++    def test_tick_does_not_run_future_job(self):
++        run_task, calls = self._mock_run_task()
++        scheduler.schedule_task(
++            self.project_id, "j", "p",
++            trigger_type="one_shot",
++            trigger_config={"at": 9999999999.0},
++            db_path=self.db_path,
++        )
++        scheduler.tick(
++            self.project_id,
++            run_task_fn=run_task,
++            db_path=self.db_path,
++            _now=1000.0,
++        )
++        self.assertEqual(len(calls), 0)
++
++    def test_tick_does_not_run_paused_job(self):
++        run_task, calls = self._mock_run_task()
++        job_id = scheduler.schedule_task(
++            self.project_id, "j", "p",
++            trigger_type="one_shot",
++            trigger_config={"at": 1000.0},
++            db_path=self.db_path,
++        )
++        scheduler.pause_job(job_id, db_path=self.db_path)
++        scheduler.tick(
++            self.project_id,
++            run_task_fn=run_task,
++            db_path=self.db_path,
++            _now=2000.0,
++        )
++        self.assertEqual(len(calls), 0)
++
++    def test_one_shot_job_becomes_done_after_success(self):
++        run_task, _ = self._mock_run_task()
++        job_id = scheduler.schedule_task(
++            self.project_id, "j", "p",
++            trigger_type="one_shot",
++            trigger_config={"at": 1000.0},
++            db_path=self.db_path,
++        )
++        scheduler.tick(
++            self.project_id, run_task_fn=run_task,
++            db_path=self.db_path, _now=2000.0,
++        )
++        job = scheduler.get_job(job_id, db_path=self.db_path)
++        self.assertEqual(job.status, "done")
++
++    def test_interval_job_rescheduled_after_success(self):
++        run_task, _ = self._mock_run_task()
++        job_id = scheduler.schedule_task(
++            self.project_id, "j", "p",
++            trigger_type="interval",
++            trigger_config={"seconds": 300},
++            db_path=self.db_path,
++        )
++        # Force next_run_at to be in the past
++        with scheduler._open(self.db_path) as conn:
++            conn.execute("UPDATE jobs SET next_run_at=1000.0 WHERE id=?", (job_id,))
++
++        scheduler.tick(
++            self.project_id, run_task_fn=run_task,
++            db_path=self.db_path, _now=2000.0,
++        )
++        job = scheduler.get_job(job_id, db_path=self.db_path)
++        self.assertEqual(job.status, "active")
++        # next_run should be ~300s after the tick ended (somewhere > 2000)
++        self.assertGreater(job.next_run_at, 2000.0)
++
++    def test_failed_job_retried_with_backoff(self):
++        run_task, _ = self._mock_run_task(status="error")
++        job_id = scheduler.schedule_task(
++            self.project_id, "j", "p",
++            trigger_type="one_shot",
++            trigger_config={"at": 1000.0},
++            max_retries=3,
++            retry_delay_secs=60.0,
++            db_path=self.db_path,
++        )
++        scheduler.tick(
++            self.project_id, run_task_fn=run_task,
++            db_path=self.db_path, _now=2000.0,
++        )
++        job = scheduler.get_job(job_id, db_path=self.db_path)
++        # Still active, attempt incremented, next_run rescheduled
++        self.assertEqual(job.status, "active")
++        self.assertEqual(job.attempt, 1)
++        self.assertGreater(job.next_run_at, 2000.0)
++
++    def test_job_fails_permanently_after_max_retries(self):
++        run_task, _ = self._mock_run_task(status="error")
++        job_id = scheduler.schedule_task(
++            self.project_id, "j", "p",
++            trigger_type="one_shot",
++            trigger_config={"at": 1000.0},
++            max_retries=1,
++            retry_delay_secs=1.0,
++            db_path=self.db_path,
++        )
++        # Tick once — sets attempt=1, reschedules
++        scheduler.tick(
++            self.project_id, run_task_fn=run_task,
++            db_path=self.db_path, _now=2000.0,
++        )
++        # Tick again at a time past the retry deadline
++        scheduler.tick(
++            self.project_id, run_task_fn=run_task,
++            db_path=self.db_path, _now=9999.0,
++        )
++        job = scheduler.get_job(job_id, db_path=self.db_path)
++        self.assertEqual(job.status, "failed")
++
++    def test_tick_records_job_run(self):
++        run_task, _ = self._mock_run_task()
++        job_id = scheduler.schedule_task(
++            self.project_id, "j", "p",
++            trigger_type="one_shot",
++            trigger_config={"at": 1000.0},
++            db_path=self.db_path,
++        )
++        scheduler.tick(
++            self.project_id, run_task_fn=run_task,
++            db_path=self.db_path, _now=2000.0,
++        )
++        runs = scheduler.list_job_runs(job_id, db_path=self.db_path)
++        self.assertEqual(len(runs), 1)
++        self.assertEqual(runs[0].status, "complete")
++
++    def test_tick_captures_exception_without_raising(self):
++        def exploding_run_task(prompt):
++            raise RuntimeError("boom")
++
++        job_id = scheduler.schedule_task(
++            self.project_id, "j", "p",
++            trigger_type="one_shot",
++            trigger_config={"at": 1000.0},
++            db_path=self.db_path,
++        )
++        # Must not raise
++        summaries = scheduler.tick(
++            self.project_id, run_task_fn=exploding_run_task,
++            db_path=self.db_path, _now=2000.0,
++        )
++        self.assertEqual(summaries[0]["run_status"], "error")
++        self.assertIn("boom", summaries[0]["error"])
++
++    def test_tick_returns_empty_when_no_due_jobs(self):
++        run_task, _ = self._mock_run_task()
++        summaries = scheduler.tick(
++            self.project_id, run_task_fn=run_task,
++            db_path=self.db_path, _now=1000.0,
++        )
++        self.assertEqual(summaries, [])
++
++
++class TestSchedulerForgeTools(SchedulerTestBase):
++    """Smoke tests for forge.py's scheduler tool wrappers."""
++
++    def test_schedule_task_tool_and_list_jobs_tool(self):
++        import forge
++
++        with patch.object(forge, "WORKSPACE", Path(self._ws.name)), \
++             patch.object(memory, "DB_PATH", self.db_path), \
++             patch.object(workflows, "DB_PATH", self.db_path), \
++             patch.object(scheduler, "DB_PATH", self.db_path):
++
++            result = forge.schedule_task_tool(
++                name="nightly",
++                prompt="run linter",
++                trigger_type="interval",
++                trigger_config={"seconds": 3600},
++            )
++            self.assertIn("job_id", result)
++
++            jobs = forge.list_jobs_tool()
++        self.assertEqual(len(jobs), 1)
++        self.assertEqual(jobs[0]["name"], "nightly")
++
++    def test_pause_resume_cancel_via_forge_tools(self):
++        import forge
++
++        with patch.object(forge, "WORKSPACE", Path(self._ws.name)), \
++             patch.object(memory, "DB_PATH", self.db_path), \
++             patch.object(workflows, "DB_PATH", self.db_path), \
++             patch.object(scheduler, "DB_PATH", self.db_path):
++
++            r = forge.schedule_task_tool(
++                "j", "p", "interval", {"seconds": 60}
++            )
++            job_id = r["job_id"]
++
++            pause_r = forge.pause_job_tool(job_id)
++            self.assertTrue(pause_r["paused"])
++
++            resume_r = forge.resume_job_tool(job_id)
++            self.assertTrue(resume_r["resumed"])
++
++            cancel_r = forge.cancel_job_tool(job_id)
++            self.assertTrue(cancel_r["cancelled"])
++
++    def test_recall_job_runs_via_forge_tool(self):
++        import forge
++
++        def mock_run_task(prompt):
++            return {"run_id": "r1", "final_status": "complete", "answer": "done"}
++
++        with patch.object(forge, "WORKSPACE", Path(self._ws.name)), \
++             patch.object(memory, "DB_PATH", self.db_path), \
++             patch.object(workflows, "DB_PATH", self.db_path), \
++             patch.object(scheduler, "DB_PATH", self.db_path):
++
++            r = forge.schedule_task_tool("j", "say hello", "one_shot", {"at": 1.0})
++            job_id = r["job_id"]
++
++            scheduler.tick(
++                self.project_id,
++                run_task_fn=mock_run_task,
++                db_path=self.db_path,
++                _now=9999.0,
++            )
++
++            runs = forge.recall_job_runs_tool(job_id)
++        self.assertEqual(len(runs), 1)
++        self.assertEqual(runs[0]["status"], "complete")
++
++
++if __name__ == "__main__":
++    unittest.main()
+-- 
+2.43.0

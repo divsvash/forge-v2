@@ -11,6 +11,7 @@ import sandbox
 import transactions
 import memory
 import workflows as _workflows
+import scheduler as _scheduler
 from run_record import new_run, ToolCallRecord
 
 success_definition = None
@@ -234,6 +235,94 @@ def recall_workflow_runs_tool(workflow_name=None, limit=10):
     )
 
 
+# ---------- SCHEDULER TOOLS ----------
+
+def schedule_task_tool(name, prompt, trigger_type, trigger_config,
+                       max_retries=3, retry_delay_secs=60.0):
+    """
+    Schedule a task (run_task prompt) to run later or on a repeating
+    schedule. trigger_type is 'one_shot', 'interval', or 'cron'.
+    trigger_config examples:
+      one_shot  -> {"at": 1700000000.0}   (Unix timestamp)
+      interval  -> {"seconds": 3600}       (every hour)
+      cron      -> {"expr": "0 9 * * 1-5"} (09:00 Mon-Fri)
+    Returns the job id.
+    """
+    project_id = get_project_id()
+    job_id = _scheduler.schedule_task(
+        project_id, name, prompt,
+        trigger_type=trigger_type,
+        trigger_config=trigger_config,
+        max_retries=max_retries,
+        retry_delay_secs=retry_delay_secs,
+    )
+    return {"job_id": job_id, "name": name, "trigger_type": trigger_type}
+
+
+def schedule_workflow_tool(name, workflow_name, trigger_type, trigger_config,
+                           params=None, max_retries=3, retry_delay_secs=60.0):
+    """
+    Schedule a saved workflow to run on a trigger. Same trigger_type /
+    trigger_config options as schedule_task. Returns the job id.
+    """
+    project_id = get_project_id()
+    job_id = _scheduler.schedule_workflow(
+        project_id, name, workflow_name,
+        params=params or {},
+        trigger_type=trigger_type,
+        trigger_config=trigger_config,
+        max_retries=max_retries,
+        retry_delay_secs=retry_delay_secs,
+    )
+    return {"job_id": job_id, "name": name, "workflow_name": workflow_name}
+
+
+def list_jobs_tool(status=None, limit=20):
+    """
+    List scheduled jobs for this project. Optionally filter by status:
+    'active', 'paused', 'failed', or 'done'.
+    """
+    project_id = get_project_id()
+    jobs = _scheduler.list_jobs(project_id, status=status, limit=limit)
+    return [
+        {
+            "job_id": j.id,
+            "name": j.name,
+            "kind": j.kind,
+            "trigger_type": j.trigger_type,
+            "status": j.status,
+            "next_run_at": j.next_run_at,
+            "last_run_at": j.last_run_at,
+            "attempt": j.attempt,
+        }
+        for j in jobs
+    ]
+
+
+def pause_job_tool(job_id):
+    """Pause a scheduled job so it won't run until resumed."""
+    success = _scheduler.pause_job(int(job_id))
+    return {"job_id": job_id, "paused": success}
+
+
+def resume_job_tool(job_id):
+    """Resume a previously paused job."""
+    success = _scheduler.resume_job(int(job_id))
+    return {"job_id": job_id, "resumed": success}
+
+
+def cancel_job_tool(job_id):
+    """Cancel a job permanently (marks it done, never re-runs)."""
+    success = _scheduler.cancel_job(int(job_id))
+    return {"job_id": job_id, "cancelled": success}
+
+
+def recall_job_runs_tool(job_id, limit=10):
+    """Retrieve the run history for a specific job id."""
+    runs = _scheduler.list_job_runs(int(job_id), limit=limit)
+    return [r.to_dict() for r in runs]
+
+
 def search_files(query):
     matches = []
 
@@ -450,6 +539,103 @@ TOOLS = {
                 "workflow_name": {"type": "string"},
                 "limit": {"type": "integer"},
             },
+        },
+        risk="read",
+        sandboxed=False,
+    ),
+    "schedule_task": ToolSpec(
+        name="schedule_task",
+        func=schedule_task_tool,
+        schema={
+            "type": "object",
+            "properties": {
+                "name": {"type": "string"},
+                "prompt": {"type": "string"},
+                "trigger_type": {"type": "string"},
+                "trigger_config": {"type": "object"},
+                "max_retries": {"type": "integer"},
+                "retry_delay_secs": {"type": "number"},
+            },
+            "required": ["name", "prompt", "trigger_type", "trigger_config"],
+        },
+        risk="write",
+        sandboxed=False,
+    ),
+    "schedule_workflow": ToolSpec(
+        name="schedule_workflow",
+        func=schedule_workflow_tool,
+        schema={
+            "type": "object",
+            "properties": {
+                "name": {"type": "string"},
+                "workflow_name": {"type": "string"},
+                "trigger_type": {"type": "string"},
+                "trigger_config": {"type": "object"},
+                "params": {"type": "object"},
+                "max_retries": {"type": "integer"},
+                "retry_delay_secs": {"type": "number"},
+            },
+            "required": ["name", "workflow_name", "trigger_type", "trigger_config"],
+        },
+        risk="write",
+        sandboxed=False,
+    ),
+    "list_jobs": ToolSpec(
+        name="list_jobs",
+        func=list_jobs_tool,
+        schema={
+            "type": "object",
+            "properties": {
+                "status": {"type": "string"},
+                "limit": {"type": "integer"},
+            },
+        },
+        risk="read",
+        sandboxed=False,
+    ),
+    "pause_job": ToolSpec(
+        name="pause_job",
+        func=pause_job_tool,
+        schema={
+            "type": "object",
+            "properties": {"job_id": {"type": "integer"}},
+            "required": ["job_id"],
+        },
+        risk="write",
+        sandboxed=False,
+    ),
+    "resume_job": ToolSpec(
+        name="resume_job",
+        func=resume_job_tool,
+        schema={
+            "type": "object",
+            "properties": {"job_id": {"type": "integer"}},
+            "required": ["job_id"],
+        },
+        risk="write",
+        sandboxed=False,
+    ),
+    "cancel_job": ToolSpec(
+        name="cancel_job",
+        func=cancel_job_tool,
+        schema={
+            "type": "object",
+            "properties": {"job_id": {"type": "integer"}},
+            "required": ["job_id"],
+        },
+        risk="write",
+        sandboxed=False,
+    ),
+    "recall_job_runs": ToolSpec(
+        name="recall_job_runs",
+        func=recall_job_runs_tool,
+        schema={
+            "type": "object",
+            "properties": {
+                "job_id": {"type": "integer"},
+                "limit": {"type": "integer"},
+            },
+            "required": ["job_id"],
         },
         risk="read",
         sandboxed=False,
@@ -822,6 +1008,61 @@ specific workflow with workflow_name.
     "workflow_name": "code-review",
     "limit": 5
   }
+}
+
+schedule_task:
+Schedule a run_task prompt to run once, on an interval, or on a cron
+schedule. trigger_type is 'one_shot', 'interval', or 'cron'.
+
+{
+  "tool": "schedule_task",
+  "arguments": {
+    "name": "nightly-lint",
+    "prompt": "Run the linter on all Python files and report issues.",
+    "trigger_type": "cron",
+    "trigger_config": {"expr": "0 2 * * *"},
+    "max_retries": 2
+  }
+}
+
+schedule_workflow:
+Schedule a saved workflow on a trigger. Same trigger options as schedule_task.
+
+{
+  "tool": "schedule_workflow",
+  "arguments": {
+    "name": "daily-review",
+    "workflow_name": "code-review",
+    "trigger_type": "interval",
+    "trigger_config": {"seconds": 86400},
+    "params": {"filename": "calc.py"}
+  }
+}
+
+list_jobs:
+List scheduled jobs for this project. Filter by status: 'active',
+'paused', 'failed', or 'done'.
+
+{
+  "tool": "list_jobs",
+  "arguments": {"status": "active"}
+}
+
+pause_job / resume_job / cancel_job:
+Control a job by its job_id (from list_jobs or schedule_task result).
+cancel_job marks it done permanently; resume_job reactivates a paused job.
+
+{
+  "tool": "pause_job",
+  "arguments": {"job_id": 3}
+}
+
+recall_job_runs:
+Retrieve the execution history for a specific job_id.
+
+{
+  "tool": "recall_job_runs",
+  "arguments": {"job_id": 3, "limit": 5}
 }
 
 Do not invent files.

@@ -1,0 +1,1272 @@
+Subject: [PATCH] Phase 04: GitHub operator tools (Piece 9)
+
+---
+ forge.py             | 284 +++++++++++++++++++++++++++-
+ github_tools.py      | 436 +++++++++++++++++++++++++++++++++++++++++++
+ modes.py             |  38 ++++
+ test_github_tools.py | 395 +++++++++++++++++++++++++++++++++++++++
+ test_modes.py        |  10 +-
+ 5 files changed, 1157 insertions(+), 6 deletions(-)
+ create mode 100644 github_tools.py
+ create mode 100644 test_github_tools.py
+
+diff --git a/forge.py b/forge.py
+index 940a9fb..a04aab6 100644
+--- a/forge.py
++++ b/forge.py
+@@ -13,6 +13,7 @@ import memory
+ import workflows as _workflows
+ import scheduler as _scheduler
+ import modes as _modes
++import github_tools as _gh
+ from run_record import new_run, ToolCallRecord
+
+ success_definition = None
+@@ -22,6 +23,10 @@ evidence = []
+
+ WORKSPACE = Path(__file__).parent.parent / "workspace"
+
++# Point github_tools at the same workspace so git operations default to
++# the right directory. Tests override both via patch.object.
++_gh.REPO_PATH = WORKSPACE
++
+ # ---------- SANDBOX BACKEND ----------
+ # Selected once, lazily, and cached. Never assume Docker is available —
+ # ask sandbox.select_backend(), which probes the daemon and falls back to
+@@ -349,6 +354,64 @@ def list_modes_tool():
+     return _modes.list_modes()
+
+
++# ---------- GITHUB / GIT TOOLS ----------
++
++def git_status_tool():
++    """Return the working-tree status of the repo (branch, staged, unstaged, untracked)."""
++    return _gh.git_status(repo_path=WORKSPACE)
++
++
++def git_diff_tool(staged=False, file_path=None):
++    """Return the diff. staged=True for staged changes only. file_path limits to one file."""
++    return _gh.git_diff(repo_path=WORKSPACE, staged=staged, file_path=file_path)
++
++
++def git_log_tool(n=10, branch=None):
++    """Return the last n commits as structured dicts (hash, author, date, subject)."""
++    return _gh.git_log(repo_path=WORKSPACE, n=n, branch=branch)
++
++
++def git_branch_tool():
++    """List branches and show the current one."""
++    return _gh.git_branch(repo_path=WORKSPACE)
++
++
++def git_checkout_tool(name, create=False):
++    """Check out a branch. create=True to create it (-b)."""
++    return _gh.git_checkout(name=name, create=create, repo_path=WORKSPACE)
++
++
++def git_add_tool(paths=None):
++    """Stage files. paths=None stages everything. Pass a list to stage specific files."""
++    return _gh.git_add(paths=paths, repo_path=WORKSPACE)
++
++
++def git_commit_tool(message):
++    """Commit staged changes with the given message. Returns early if nothing is staged."""
++    return _gh.git_commit(message=message, repo_path=WORKSPACE)
++
++
++def git_push_tool(remote="origin", branch=None, force=False):
++    """Push to remote. force=True uses --force-with-lease (never force-push to main)."""
++    return _gh.git_push(remote=remote, branch=branch, force=force, repo_path=WORKSPACE)
++
++
++def git_clone_tool(url, dest=None):
++    """Clone a repository. dest is a directory name relative to WORKSPACE's parent."""
++    return _gh.git_clone(url=url, dest=dest, repo_path=WORKSPACE)
++
++
++def create_pull_request_tool(title, body="", base="main", head=None, draft=False):
++    """
++    Create a GitHub PR via the gh CLI. Falls back to a URL template if gh
++    is not available. Requires GITHUB_TOKEN in the environment or gh auth login.
++    """
++    return _gh.create_pull_request(
++        title=title, body=body, base=base, head=head, draft=draft,
++        repo_path=WORKSPACE,
++    )
++
++
+ def search_files(query):
+     matches = []
+
+@@ -686,6 +749,132 @@ TOOLS = {
+         risk="read",
+         sandboxed=False,
+     ),
++
++    # ---------- GITHUB / GIT TOOLS ----------
++    "git_status": ToolSpec(
++        name="git_status",
++        func=git_status_tool,
++        schema={"type": "object", "properties": {}},
++        risk="read",
++        sandboxed=False,
++    ),
++    "git_diff": ToolSpec(
++        name="git_diff",
++        func=git_diff_tool,
++        schema={
++            "type": "object",
++            "properties": {
++                "staged": {"type": "boolean"},
++                "file_path": {"type": "string"},
++            },
++        },
++        risk="read",
++        sandboxed=False,
++    ),
++    "git_log": ToolSpec(
++        name="git_log",
++        func=git_log_tool,
++        schema={
++            "type": "object",
++            "properties": {
++                "n": {"type": "integer"},
++                "branch": {"type": "string"},
++            },
++        },
++        risk="read",
++        sandboxed=False,
++    ),
++    "git_branch": ToolSpec(
++        name="git_branch",
++        func=git_branch_tool,
++        schema={"type": "object", "properties": {}},
++        risk="read",
++        sandboxed=False,
++    ),
++    "git_checkout": ToolSpec(
++        name="git_checkout",
++        func=git_checkout_tool,
++        schema={
++            "type": "object",
++            "properties": {
++                "name": {"type": "string"},
++                "create": {"type": "boolean"},
++            },
++            "required": ["name"],
++        },
++        risk="write",
++        sandboxed=False,
++    ),
++    "git_add": ToolSpec(
++        name="git_add",
++        func=git_add_tool,
++        schema={
++            "type": "object",
++            "properties": {
++                "paths": {"type": "array", "items": {"type": "string"}},
++            },
++        },
++        risk="write",
++        sandboxed=False,
++    ),
++    "git_commit": ToolSpec(
++        name="git_commit",
++        func=git_commit_tool,
++        schema={
++            "type": "object",
++            "properties": {
++                "message": {"type": "string"},
++            },
++            "required": ["message"],
++        },
++        risk="write",
++        sandboxed=False,
++    ),
++    "git_push": ToolSpec(
++        name="git_push",
++        func=git_push_tool,
++        schema={
++            "type": "object",
++            "properties": {
++                "remote": {"type": "string"},
++                "branch": {"type": "string"},
++                "force": {"type": "boolean"},
++            },
++        },
++        risk="exec",
++        sandboxed=False,
++    ),
++    "git_clone": ToolSpec(
++        name="git_clone",
++        func=git_clone_tool,
++        schema={
++            "type": "object",
++            "properties": {
++                "url": {"type": "string"},
++                "dest": {"type": "string"},
++            },
++            "required": ["url"],
++        },
++        risk="exec",
++        sandboxed=False,
++    ),
++    "create_pull_request": ToolSpec(
++        name="create_pull_request",
++        func=create_pull_request_tool,
++        schema={
++            "type": "object",
++            "properties": {
++                "title": {"type": "string"},
++                "body": {"type": "string"},
++                "base": {"type": "string"},
++                "head": {"type": "string"},
++                "draft": {"type": "boolean"},
++            },
++            "required": ["title"],
++        },
++        risk="exec",
++        sandboxed=False,
++    ),
+ }
+
+
+@@ -1123,13 +1312,106 @@ mini_divs, intern, growth) with their descriptions and tool access.
+ set_mode:
+ Switch the active personality for this project. Persists across runs.
+ Valid mode_id values: researcher, planner, coding_agent, mini_divs,
+-intern, growth.
++intern, growth, github_operator.
+
+ {
+   "tool": "set_mode",
+   "arguments": {"mode_id": "researcher"}
+ }
+
++git_status:
++Show the working-tree status: current branch, staged/unstaged/untracked files.
++Always call this before committing or pushing.
++
++{
++  "tool": "git_status",
++  "arguments": {}
++}
++
++git_diff:
++Show changes not yet staged (staged=false, the default) or changes staged for
++commit (staged=true). Pass file_path to limit to one file.
++
++{
++  "tool": "git_diff",
++  "arguments": {"staged": true}
++}
++
++git_log:
++Show the last n commits (default 10) as structured dicts. Pass branch to
++inspect another branch.
++
++{
++  "tool": "git_log",
++  "arguments": {"n": 5}
++}
++
++git_branch:
++List all local branches and show which one is current.
++
++{
++  "tool": "git_branch",
++  "arguments": {}
++}
++
++git_checkout:
++Check out a branch. Pass create=true to create it (-b). Never force-push to
++main/master — create a feature branch instead.
++
++{
++  "tool": "git_checkout",
++  "arguments": {"name": "feature/my-change", "create": true}
++}
++
++git_add:
++Stage files for commit. paths=null stages everything. Pass a list to stage
++specific files.
++
++{
++  "tool": "git_add",
++  "arguments": {"paths": ["src/foo.py", "tests/test_foo.py"]}
++}
++
++git_commit:
++Commit staged changes with a message. Returns committed=false (with a reason)
++if nothing is staged — use git_add first.
++
++{
++  "tool": "git_commit",
++  "arguments": {"message": "feat: add retry backoff to scheduler"}
++}
++
++git_push:
++Push to remote. force=true uses --force-with-lease (safer than --force).
++Never force-push to main/master.
++
++{
++  "tool": "git_push",
++  "arguments": {"remote": "origin", "branch": "feature/my-change"}
++}
++
++git_clone:
++Clone a repository. dest is a directory name relative to the workspace parent.
++
++{
++  "tool": "git_clone",
++  "arguments": {"url": "https://github.com/owner/repo.git", "dest": "repo"}
++}
++
++create_pull_request:
++Create a GitHub PR via the gh CLI. Falls back to a URL template if gh is not
++available. base defaults to "main". head defaults to the current branch.
++
++{
++  "tool": "create_pull_request",
++  "arguments": {
++    "title": "feat: add GitHub operator mode",
++    "body": "Adds git_* tools and github_operator personality to Forge.",
++    "base": "main",
++    "draft": false
++  }
++}
++
+ Do not invent files.
+ Do not access files outside the workspace.
+
+diff --git a/github_tools.py b/github_tools.py
+new file mode 100644
+index 0000000..3cbe240
+--- /dev/null
++++ b/github_tools.py
+@@ -0,0 +1,436 @@
++"""
++github_tools.py — GitHub / Git operator tools for Forge.
++
++Phase 04 integrations: gives Forge the ability to work with Git repos
++directly — clone, inspect status/diff, branch, commit, push, open PRs.
++These are the tools the Coding Agent and Mini Divs modes use when Forge
++is asked to "open a PR", "commit my changes", or "review what changed".
++
++Design decisions
++----------------
++
++subprocess, not GitPython
++  No new dependencies. Every operation is a plain `git` subprocess call.
++  Results are structured dicts, not raw CLI output, so callers can reason
++  about them without parsing.
++
++Explicit working-directory scoping
++  Every function takes an optional `repo_path` that defaults to
++  `REPO_PATH` (the module-level default, which forge.py sets from
++  WORKSPACE or a configured clone directory). Tests override it via
++  patch.object — same pattern as DB_PATH in memory.py.
++
++Safe-by-default
++  - `git_push` requires explicit `force=True` to force-push; default is
++    always a normal push.
++  - `git_commit` will not commit if the working tree is clean (returns a
++    clear message rather than an error).
++  - `create_pull_request` uses the GitHub CLI (`gh`) when available,
++    falls back to returning a URL template the user can open manually.
++  - No credential storage: tokens come from the environment
++    (GITHUB_TOKEN / GH_TOKEN), which is where `gh` already looks.
++
++Operations
++----------
++  git_status(repo_path)         → {branch, clean, staged, unstaged,
++                                    untracked}
++  git_diff(repo_path, staged,   → {diff: str, files_changed: [str]}
++           file_path)
++  git_log(repo_path, n, branch) → [{hash, author, date, subject}]
++  git_branch(repo_path)         → {current, branches: [str]}
++  git_checkout(repo_path, name, → {branch, created}
++               create)
++  git_add(repo_path, paths)     → {staged: [str]}
++  git_commit(repo_path, message)→ {committed, hash, message}
++  git_push(repo_path, remote,   → {pushed, branch, remote, output}
++           branch, force)
++  git_clone(url, dest,          → {cloned, path, url}
++            repo_path)
++  create_pull_request(          → {created, url, title, number}
++    repo_path, title, body,
++    base, head, draft)
++"""
++
++from __future__ import annotations
++
++import os
++import subprocess
++from pathlib import Path
++from typing import Optional
++
++# Default repo path — forge.py sets this to WORKSPACE (or a sibling
++# directory for clones). Tests override via patch.object.
++REPO_PATH: Optional[Path] = None
++
++
++# ---------------------------------------------------------------------------
++# Internal helpers
++# ---------------------------------------------------------------------------
++
++def _run(args: list[str], cwd: Path, env: Optional[dict] = None,
++         timeout: int = 30) -> tuple[int, str, str]:
++    """Run a git command; return (returncode, stdout, stderr)."""
++    result = subprocess.run(
++        args,
++        cwd=str(cwd),
++        capture_output=True,
++        text=True,
++        timeout=timeout,
++        env=env or {**os.environ},
++    )
++    return result.returncode, result.stdout.strip(), result.stderr.strip()
++
++
++def _resolve(repo_path: Optional[Path]) -> Path:
++    """Resolve repo_path, falling back to module REPO_PATH."""
++    p = repo_path if repo_path is not None else REPO_PATH
++    if p is None:
++        raise ValueError(
++            "No repo_path provided and REPO_PATH is not set. "
++            "Pass repo_path explicitly or set github_tools.REPO_PATH."
++        )
++    return Path(p)
++
++
++def _gh_available() -> bool:
++    try:
++        rc, _, _ = _run(["gh", "--version"], cwd=Path("/tmp"))
++        return rc == 0
++    except (FileNotFoundError, subprocess.TimeoutExpired):
++        return False
++
++
++# ---------------------------------------------------------------------------
++# Public API
++# ---------------------------------------------------------------------------
++
++def git_status(repo_path: Optional[Path] = None) -> dict:
++    """
++    Return the working-tree status of the repo.
++    staged: files with changes staged for commit.
++    unstaged: modified tracked files not yet staged.
++    untracked: new files not tracked by git.
++    """
++    repo = _resolve(repo_path)
++    rc, out, err = _run(["git", "status", "--porcelain=v1", "-b"], cwd=repo)
++    if rc != 0:
++        return {"error": err or "git status failed", "repo": str(repo)}
++
++    lines = out.splitlines()
++    branch = "unknown"
++    staged, unstaged, untracked = [], [], []
++
++    for line in lines:
++        if line.startswith("## "):
++            # ## main...origin/main [ahead 1]
++            branch_part = line[3:].split("...")[0].split(" ")[0]
++            branch = branch_part
++            continue
++        if len(line) < 2:
++            continue
++        xy, path = line[:2], line[3:]
++        # Rename: "old -> new"
++        if " -> " in path:
++            path = path.split(" -> ")[-1]
++        x, y = xy[0], xy[1]
++        if x != " " and x != "?":
++            staged.append(path)
++        if y not in (" ", "?"):
++            unstaged.append(path)
++        if xy == "??":
++            untracked.append(path)
++
++    return {
++        "branch": branch,
++        "clean": not staged and not unstaged and not untracked,
++        "staged": staged,
++        "unstaged": unstaged,
++        "untracked": untracked,
++        "repo": str(repo),
++    }
++
++
++def git_diff(repo_path: Optional[Path] = None,
++             staged: bool = False,
++             file_path: Optional[str] = None) -> dict:
++    """
++    Return the diff for the working tree (or staged changes).
++    Pass staged=True for `git diff --cached`.
++    Pass file_path to limit to one file.
++    """
++    repo = _resolve(repo_path)
++    args = ["git", "diff"]
++    if staged:
++        args.append("--cached")
++    args += ["--stat", "--patch"]
++    if file_path:
++        args += ["--", file_path]
++
++    rc, out, err = _run(args, cwd=repo)
++    if rc != 0:
++        return {"error": err or "git diff failed", "diff": ""}
++
++    # Extract changed file names from the stat block.
++    files_changed = []
++    for line in out.splitlines():
++        if "|" in line:
++            files_changed.append(line.split("|")[0].strip())
++
++    return {
++        "diff": out,
++        "files_changed": files_changed,
++        "staged": staged,
++        "repo": str(repo),
++    }
++
++
++def git_log(repo_path: Optional[Path] = None,
++            n: int = 10,
++            branch: Optional[str] = None) -> list[dict]:
++    """
++    Return the last n commits as structured dicts.
++    """
++    repo = _resolve(repo_path)
++    fmt = "%H%x1f%an%x1f%ad%x1f%s"   # hash, author, date, subject
++    args = ["git", "log", f"-{n}", f"--format={fmt}", "--date=short"]
++    if branch:
++        args.append(branch)
++
++    rc, out, err = _run(args, cwd=repo)
++    if rc != 0:
++        return [{"error": err or "git log failed"}]
++
++    commits = []
++    for line in out.splitlines():
++        if not line.strip():
++            continue
++        parts = line.split("\x1f")
++        if len(parts) == 4:
++            commits.append({
++                "hash": parts[0][:12],
++                "author": parts[1],
++                "date": parts[2],
++                "subject": parts[3],
++            })
++    return commits
++
++
++def git_branch(repo_path: Optional[Path] = None) -> dict:
++    """List branches; mark the current one."""
++    repo = _resolve(repo_path)
++    rc, out, err = _run(["git", "branch", "--list"], cwd=repo)
++    if rc != 0:
++        return {"error": err or "git branch failed"}
++
++    branches = []
++    current = None
++    for line in out.splitlines():
++        name = line.strip().lstrip("* ").strip()
++        if line.startswith("*"):
++            current = name
++        branches.append(name)
++
++    return {"current": current, "branches": branches, "repo": str(repo)}
++
++
++def git_checkout(name: str,
++                 create: bool = False,
++                 repo_path: Optional[Path] = None) -> dict:
++    """
++    Check out a branch. Pass create=True to create it (-b).
++    """
++    repo = _resolve(repo_path)
++    args = ["git", "checkout"]
++    if create:
++        args.append("-b")
++    args.append(name)
++
++    rc, out, err = _run(args, cwd=repo)
++    if rc != 0:
++        return {"error": err or f"git checkout {name!r} failed", "branch": name}
++
++    return {"branch": name, "created": create, "repo": str(repo)}
++
++
++def git_add(paths: Optional[list[str]] = None,
++            repo_path: Optional[Path] = None) -> dict:
++    """
++    Stage files. Pass paths=None or paths=['.'] to stage everything.
++    """
++    repo = _resolve(repo_path)
++    targets = paths if paths else ["."]
++    args = ["git", "add", "--"] + targets
++
++    rc, out, err = _run(args, cwd=repo)
++    if rc != 0:
++        return {"error": err or "git add failed", "staged": []}
++
++    # Confirm what ended up staged
++    status = git_status(repo_path=repo)
++    return {"staged": status.get("staged", []), "repo": str(repo)}
++
++
++def git_commit(message: str,
++               repo_path: Optional[Path] = None) -> dict:
++    """
++    Commit staged changes. Returns early (committed=False) if nothing
++    is staged, to avoid an empty-commit error.
++    """
++    repo = _resolve(repo_path)
++    status = git_status(repo_path=repo)
++    if not status.get("staged"):
++        return {
++            "committed": False,
++            "message": message,
++            "reason": "nothing staged — use git_add first",
++            "repo": str(repo),
++        }
++
++    rc, out, err = _run(["git", "commit", "-m", message], cwd=repo)
++    if rc != 0:
++        return {"committed": False, "error": err or "git commit failed"}
++
++    # Extract the new commit hash from the output line like
++    # "[main abc1234] commit message"
++    commit_hash = ""
++    for line in out.splitlines():
++        if line.startswith("["):
++            parts = line.split()
++            if len(parts) >= 2:
++                commit_hash = parts[1].rstrip("]")
++            break
++
++    return {
++        "committed": True,
++        "hash": commit_hash,
++        "message": message,
++        "repo": str(repo),
++    }
++
++
++def git_push(remote: str = "origin",
++             branch: Optional[str] = None,
++             force: bool = False,
++             repo_path: Optional[Path] = None) -> dict:
++    """
++    Push to remote. force=True adds --force-with-lease (safer than
++    --force: fails if the remote has commits the local doesn't have).
++    """
++    repo = _resolve(repo_path)
++    args = ["git", "push", remote]
++    if branch:
++        args.append(branch)
++    if force:
++        args.append("--force-with-lease")
++
++    rc, out, err = _run(args, cwd=repo, timeout=60)
++    output = (out + "\n" + err).strip()
++    if rc != 0:
++        return {"pushed": False, "error": output, "remote": remote}
++
++    return {
++        "pushed": True,
++        "remote": remote,
++        "branch": branch,
++        "output": output,
++        "repo": str(repo),
++    }
++
++
++def git_clone(url: str,
++              dest: Optional[str] = None,
++              repo_path: Optional[Path] = None) -> dict:
++    """
++    Clone a repository. dest is a directory name relative to the
++    parent of repo_path (or an absolute path). Returns the path cloned to.
++    """
++    # Determine where to clone.
++    base = _resolve(repo_path).parent if repo_path is not None or REPO_PATH is not None else Path.cwd()
++    if dest:
++        clone_to = Path(dest) if Path(dest).is_absolute() else base / dest
++    else:
++        # Derive from URL: "https://github.com/user/repo.git" → "repo"
++        name = url.rstrip("/").split("/")[-1]
++        if name.endswith(".git"):
++            name = name[:-4]
++        clone_to = base / name
++
++    if clone_to.exists():
++        return {
++            "cloned": False,
++            "path": str(clone_to),
++            "reason": "destination already exists",
++            "url": url,
++        }
++
++    rc, out, err = _run(
++        ["git", "clone", url, str(clone_to)],
++        cwd=base,
++        timeout=120,
++    )
++    if rc != 0:
++        return {"cloned": False, "error": err or "git clone failed", "url": url}
++
++    return {"cloned": True, "path": str(clone_to), "url": url}
++
++
++def create_pull_request(title: str,
++                        body: str = "",
++                        base: str = "main",
++                        head: Optional[str] = None,
++                        draft: bool = False,
++                        repo_path: Optional[Path] = None) -> dict:
++    """
++    Create a GitHub PR using the `gh` CLI when available.
++    Falls back to a URL template the user can open manually.
++
++    Requires GITHUB_TOKEN or GH_TOKEN in the environment, or the user
++    to have run `gh auth login` already.
++    """
++    repo = _resolve(repo_path)
++
++    if not _gh_available():
++        # Return a manual fallback — the user can click the URL
++        status = git_status(repo_path=repo)
++        current_branch = head or status.get("branch", "HEAD")
++        url_template = (
++            f"https://github.com/<owner>/<repo>/compare/{base}...{current_branch}"
++            "?expand=1"
++        )
++        return {
++            "created": False,
++            "reason": "gh CLI not available — open the URL to create the PR manually",
++            "url": url_template,
++            "title": title,
++        }
++
++    args = [
++        "gh", "pr", "create",
++        "--title", title,
++        "--body", body,
++        "--base", base,
++    ]
++    if head:
++        args += ["--head", head]
++    if draft:
++        args.append("--draft")
++
++    rc, out, err = _run(args, cwd=repo, timeout=60)
++    if rc != 0:
++        return {"created": False, "error": err or out or "gh pr create failed"}
++
++    # `gh pr create` outputs the PR URL on success
++    pr_url = out.strip()
++    pr_number = ""
++    if pr_url:
++        pr_number = pr_url.rstrip("/").split("/")[-1]
++
++    return {
++        "created": True,
++        "url": pr_url,
++        "number": pr_number,
++        "title": title,
++        "base": base,
++        "draft": draft,
++        "repo": str(repo),
++    }
+diff --git a/modes.py b/modes.py
+index d410236..f51807b 100644
+--- a/modes.py
++++ b/modes.py
+@@ -232,6 +232,44 @@ results.
+         default_max_steps=15,
+         default_max_stalls=2,
+     ),
++
++    "github_operator": Mode(
++        id="github_operator",
++        display_name="GitHub Operator",
++        description="Git/GitHub workflows — branch, commit, diff, push, open PRs.",
++        system_prompt_prefix="""\
++You are Forge in GITHUB OPERATOR mode.
++
++You manage Git repositories and GitHub workflows. Your job is to inspect
++state, make commits, open branches, push changes, and create pull requests
++— using the git_* and create_pull_request tools rather than raw shell
++commands.
++
++Workflow discipline:
++1. Always run git_status first to understand what's staged/unstaged.
++2. Use git_diff (staged=True) before committing — confirm the change is
++   exactly what was intended.
++3. Write clear, imperative commit messages (what this commit does, not
++   what you changed).
++4. Never force-push to main/master. Create a branch, push to it, then
++   open a PR.
++5. When opening a PR: title is a one-liner of the change; body lists
++   what changed and why, and links to relevant run_ids from recall_runs.
++
++If git operations fail (merge conflict, auth error, dirty tree) stop and
++report exactly what failed — do not guess or paper over it.
++""",
++        allowed_tools=frozenset({
++            "list_files", "read_file", "search_files",
++            "run_command",
++            "git_status", "git_diff", "git_log", "git_branch",
++            "git_checkout", "git_add", "git_commit", "git_push",
++            "git_clone", "create_pull_request",
++            "remember", "recall", "recall_runs",
++        }),
++        default_max_steps=20,
++        default_max_stalls=3,
++    ),
+ }
+
+ DEFAULT_MODE_ID = "coding_agent"
+diff --git a/test_github_tools.py b/test_github_tools.py
+new file mode 100644
+index 0000000..3bec631
+--- /dev/null
++++ b/test_github_tools.py
+@@ -0,0 +1,395 @@
++"""
++test_github_tools.py — unit tests for github_tools.py and forge.py git wiring.
++
++Tests use real git repos created in temp directories so we can verify actual
++subprocess behaviour without mocking git itself.  The only things mocked are:
++- github_tools.REPO_PATH  (so we can point at a temp repo)
++- _gh_available()          (so create_pull_request tests run without gh CLI)
++"""
++
++import unittest
++import subprocess
++import os
++from pathlib import Path
++from tempfile import TemporaryDirectory
++from unittest.mock import patch
++
++import github_tools as _gh
++
++
++# ---------------------------------------------------------------------------
++# Helpers
++# ---------------------------------------------------------------------------
++
++def _init_repo(path: Path, bare: bool = False) -> Path:
++    """Create a minimal git repo with one commit."""
++    path.mkdir(parents=True, exist_ok=True)
++    env = {**os.environ, "GIT_AUTHOR_NAME": "Test", "GIT_AUTHOR_EMAIL": "t@t.com",
++           "GIT_COMMITTER_NAME": "Test", "GIT_COMMITTER_EMAIL": "t@t.com"}
++    subprocess.run(["git", "init"], cwd=str(path), check=True,
++                   capture_output=True, env=env)
++    subprocess.run(["git", "config", "user.email", "t@t.com"],
++                   cwd=str(path), check=True, capture_output=True, env=env)
++    subprocess.run(["git", "config", "user.name", "Test"],
++                   cwd=str(path), check=True, capture_output=True, env=env)
++    # Initial commit
++    readme = path / "README.md"
++    readme.write_text("# test\n")
++    subprocess.run(["git", "add", "."], cwd=str(path), check=True,
++                   capture_output=True, env=env)
++    subprocess.run(["git", "commit", "-m", "init"],
++                   cwd=str(path), check=True, capture_output=True, env=env)
++    return path
++
++
++# ---------------------------------------------------------------------------
++# TestGitStatus
++# ---------------------------------------------------------------------------
++
++class TestGitStatus(unittest.TestCase):
++    def setUp(self):
++        self._tmp = TemporaryDirectory()
++        self.repo = _init_repo(Path(self._tmp.name) / "repo")
++
++    def tearDown(self):
++        self._tmp.cleanup()
++
++    def test_clean_repo_has_no_changes(self):
++        result = _gh.git_status(repo_path=self.repo)
++        self.assertTrue(result["clean"])
++        self.assertEqual(result["staged"], [])
++        self.assertEqual(result["unstaged"], [])
++        self.assertEqual(result["untracked"], [])
++
++    def test_new_untracked_file_appears(self):
++        (self.repo / "new.py").write_text("x = 1\n")
++        result = _gh.git_status(repo_path=self.repo)
++        self.assertFalse(result["clean"])
++        self.assertIn("new.py", result["untracked"])
++
++    def test_staged_file_appears(self):
++        (self.repo / "staged.py").write_text("y = 2\n")
++        subprocess.run(["git", "add", "staged.py"], cwd=str(self.repo),
++                       check=True, capture_output=True)
++        result = _gh.git_status(repo_path=self.repo)
++        self.assertIn("staged.py", result["staged"])
++
++    def test_branch_name_is_returned(self):
++        result = _gh.git_status(repo_path=self.repo)
++        self.assertIsInstance(result["branch"], str)
++        self.assertGreater(len(result["branch"]), 0)
++
++    def test_resolve_error_when_repo_path_none(self):
++        with patch.object(_gh, "REPO_PATH", None):
++            with self.assertRaises(ValueError):
++                _gh.git_status(repo_path=None)
++
++
++# ---------------------------------------------------------------------------
++# TestGitDiff
++# ---------------------------------------------------------------------------
++
++class TestGitDiff(unittest.TestCase):
++    def setUp(self):
++        self._tmp = TemporaryDirectory()
++        self.repo = _init_repo(Path(self._tmp.name) / "repo")
++
++    def tearDown(self):
++        self._tmp.cleanup()
++
++    def test_no_diff_on_clean_repo(self):
++        result = _gh.git_diff(repo_path=self.repo)
++        self.assertEqual(result["diff"], "")
++        self.assertEqual(result["files_changed"], [])
++
++    def test_unstaged_diff_shows_modification(self):
++        (self.repo / "README.md").write_text("# changed\n")
++        result = _gh.git_diff(repo_path=self.repo)
++        self.assertIn("README.md", result["diff"])
++
++    def test_staged_diff_shows_staged_file(self):
++        (self.repo / "new.py").write_text("z = 3\n")
++        subprocess.run(["git", "add", "new.py"], cwd=str(self.repo),
++                       check=True, capture_output=True)
++        result = _gh.git_diff(repo_path=self.repo, staged=True)
++        self.assertIn("new.py", result["diff"])
++        self.assertTrue(result["staged"])
++
++
++# ---------------------------------------------------------------------------
++# TestGitLog
++# ---------------------------------------------------------------------------
++
++class TestGitLog(unittest.TestCase):
++    def setUp(self):
++        self._tmp = TemporaryDirectory()
++        self.repo = _init_repo(Path(self._tmp.name) / "repo")
++
++    def tearDown(self):
++        self._tmp.cleanup()
++
++    def test_log_returns_list_of_commits(self):
++        result = _gh.git_log(repo_path=self.repo, n=5)
++        self.assertIsInstance(result, list)
++        self.assertGreater(len(result), 0)
++
++    def test_commit_has_expected_keys(self):
++        commits = _gh.git_log(repo_path=self.repo)
++        for c in commits:
++            self.assertIn("hash", c)
++            self.assertIn("author", c)
++            self.assertIn("date", c)
++            self.assertIn("subject", c)
++
++    def test_initial_commit_message_in_log(self):
++        commits = _gh.git_log(repo_path=self.repo)
++        subjects = [c["subject"] for c in commits]
++        self.assertIn("init", subjects)
++
++
++# ---------------------------------------------------------------------------
++# TestGitBranch
++# ---------------------------------------------------------------------------
++
++class TestGitBranch(unittest.TestCase):
++    def setUp(self):
++        self._tmp = TemporaryDirectory()
++        self.repo = _init_repo(Path(self._tmp.name) / "repo")
++
++    def tearDown(self):
++        self._tmp.cleanup()
++
++    def test_branch_returns_current(self):
++        result = _gh.git_branch(repo_path=self.repo)
++        self.assertIsNotNone(result["current"])
++        self.assertIn(result["current"], result["branches"])
++
++    def test_new_branch_appears_in_list(self):
++        subprocess.run(["git", "branch", "feature/x"], cwd=str(self.repo),
++                       check=True, capture_output=True)
++        result = _gh.git_branch(repo_path=self.repo)
++        self.assertIn("feature/x", result["branches"])
++
++
++# ---------------------------------------------------------------------------
++# TestGitCheckout
++# ---------------------------------------------------------------------------
++
++class TestGitCheckout(unittest.TestCase):
++    def setUp(self):
++        self._tmp = TemporaryDirectory()
++        self.repo = _init_repo(Path(self._tmp.name) / "repo")
++
++    def tearDown(self):
++        self._tmp.cleanup()
++
++    def test_checkout_creates_new_branch(self):
++        result = _gh.git_checkout("feature/new", create=True,
++                                   repo_path=self.repo)
++        self.assertEqual(result["branch"], "feature/new")
++        self.assertTrue(result["created"])
++        # Verify we're on it
++        status = _gh.git_status(repo_path=self.repo)
++        self.assertEqual(status["branch"], "feature/new")
++
++    def test_checkout_existing_branch(self):
++        subprocess.run(["git", "branch", "other"], cwd=str(self.repo),
++                       check=True, capture_output=True)
++        result = _gh.git_checkout("other", create=False, repo_path=self.repo)
++        self.assertEqual(result["branch"], "other")
++        self.assertFalse(result["created"])
++
++    def test_checkout_nonexistent_branch_returns_error(self):
++        result = _gh.git_checkout("does-not-exist", repo_path=self.repo)
++        self.assertIn("error", result)
++
++
++# ---------------------------------------------------------------------------
++# TestGitAddAndCommit
++# ---------------------------------------------------------------------------
++
++class TestGitAddAndCommit(unittest.TestCase):
++    def setUp(self):
++        self._tmp = TemporaryDirectory()
++        self.repo = _init_repo(Path(self._tmp.name) / "repo")
++        # git needs an identity
++        env = {**os.environ}
++        subprocess.run(["git", "config", "user.email", "t@t.com"],
++                       cwd=str(self.repo), capture_output=True, env=env)
++        subprocess.run(["git", "config", "user.name", "Test"],
++                       cwd=str(self.repo), capture_output=True, env=env)
++
++    def tearDown(self):
++        self._tmp.cleanup()
++
++    def test_add_all_stages_new_file(self):
++        (self.repo / "foo.py").write_text("x=1\n")
++        result = _gh.git_add(repo_path=self.repo)
++        self.assertIn("foo.py", result["staged"])
++
++    def test_add_specific_file(self):
++        (self.repo / "a.py").write_text("a=1\n")
++        (self.repo / "b.py").write_text("b=2\n")
++        result = _gh.git_add(paths=["a.py"], repo_path=self.repo)
++        self.assertIn("a.py", result["staged"])
++        # b.py should still be untracked, not staged
++        self.assertNotIn("b.py", result["staged"])
++
++    def test_commit_nothing_staged_returns_false(self):
++        result = _gh.git_commit("empty commit", repo_path=self.repo)
++        self.assertFalse(result["committed"])
++        self.assertIn("reason", result)
++
++    def test_commit_after_add_succeeds(self):
++        (self.repo / "new.py").write_text("n=1\n")
++        _gh.git_add(repo_path=self.repo)
++        result = _gh.git_commit("add new.py", repo_path=self.repo)
++        self.assertTrue(result["committed"])
++        self.assertIsInstance(result["hash"], str)
++        self.assertGreater(len(result["hash"]), 0)
++
++    def test_commit_hash_appears_in_log(self):
++        (self.repo / "z.py").write_text("z=9\n")
++        _gh.git_add(repo_path=self.repo)
++        commit_result = _gh.git_commit("add z", repo_path=self.repo)
++        log = _gh.git_log(repo_path=self.repo, n=1)
++        self.assertIn(commit_result["hash"], log[0]["hash"])
++
++
++# ---------------------------------------------------------------------------
++# TestGitClone
++# ---------------------------------------------------------------------------
++
++class TestGitClone(unittest.TestCase):
++    def setUp(self):
++        self._tmp = TemporaryDirectory()
++        self.source = _init_repo(Path(self._tmp.name) / "source")
++
++    def tearDown(self):
++        self._tmp.cleanup()
++
++    def test_clone_local_repo(self):
++        dest = Path(self._tmp.name) / "cloned"
++        with patch.object(_gh, "REPO_PATH", self.source):
++            result = _gh.git_clone(url=str(self.source), dest=str(dest))
++        self.assertTrue(result["cloned"])
++        self.assertTrue(dest.exists())
++        self.assertTrue((dest / "README.md").exists())
++
++    def test_clone_to_existing_dest_returns_false(self):
++        dest = Path(self._tmp.name) / "already_exists"
++        dest.mkdir()
++        with patch.object(_gh, "REPO_PATH", self.source):
++            result = _gh.git_clone(url=str(self.source), dest=str(dest))
++        self.assertFalse(result["cloned"])
++        self.assertIn("reason", result)
++
++
++# ---------------------------------------------------------------------------
++# TestCreatePullRequest
++# ---------------------------------------------------------------------------
++
++class TestCreatePullRequest(unittest.TestCase):
++    def setUp(self):
++        self._tmp = TemporaryDirectory()
++        self.repo = _init_repo(Path(self._tmp.name) / "repo")
++
++    def tearDown(self):
++        self._tmp.cleanup()
++
++    def test_fallback_when_gh_not_available(self):
++        with patch.object(_gh, "_gh_available", return_value=False):
++            result = _gh.create_pull_request(
++                title="Test PR",
++                body="body",
++                base="main",
++                repo_path=self.repo,
++            )
++        self.assertFalse(result["created"])
++        self.assertIn("url", result)
++        self.assertIn("reason", result)
++
++    def test_fallback_url_contains_base_branch(self):
++        with patch.object(_gh, "_gh_available", return_value=False):
++            result = _gh.create_pull_request(
++                title="Test PR",
++                base="develop",
++                repo_path=self.repo,
++            )
++        self.assertIn("develop", result["url"])
++
++
++# ---------------------------------------------------------------------------
++# TestGitToolsWiredInForge
++# ---------------------------------------------------------------------------
++
++class TestGitToolsWiredInForge(unittest.TestCase):
++    """
++    Verify that git tool wrapper functions and ToolSpec entries exist in
++    forge.py and are callable.  Uses a real temp repo but doesn't run the
++    full LLM loop.
++    """
++
++    def setUp(self):
++        self._tmp = TemporaryDirectory()
++        self.repo = _init_repo(Path(self._tmp.name) / "repo")
++
++    def tearDown(self):
++        self._tmp.cleanup()
++
++    def test_all_git_tools_in_forge_tools_dict(self):
++        import forge
++        expected = {
++            "git_status", "git_diff", "git_log", "git_branch",
++            "git_checkout", "git_add", "git_commit", "git_push",
++            "git_clone", "create_pull_request",
++        }
++        self.assertTrue(expected.issubset(set(forge.TOOLS.keys())))
++
++    def test_git_status_tool_callable(self):
++        import forge
++        with patch.object(forge, "WORKSPACE", self.repo), \
++             patch.object(_gh, "REPO_PATH", self.repo):
++            result = forge.git_status_tool()
++        self.assertIn("branch", result)
++        self.assertIn("clean", result)
++
++    def test_git_log_tool_callable(self):
++        import forge
++        with patch.object(forge, "WORKSPACE", self.repo), \
++             patch.object(_gh, "REPO_PATH", self.repo):
++            result = forge.git_log_tool(n=3)
++        self.assertIsInstance(result, list)
++        self.assertGreater(len(result), 0)
++
++    def test_github_operator_mode_in_forge_tools_set(self):
++        """
++        github_operator mode's allowed_tools set should reference only tools
++        that actually exist in forge.TOOLS.
++        """
++        import forge
++        import modes
++        github_mode = modes.MODES["github_operator"]
++        for tool_name in github_mode.allowed_tools:
++            self.assertIn(
++                tool_name, forge.TOOLS,
++                f"github_operator mode references '{tool_name}' which is not in forge.TOOLS",
++            )
++
++    def test_git_tools_not_accessible_in_researcher_mode(self):
++        import modes
++        researcher = modes.MODES["researcher"]
++        for git_tool in ("git_commit", "git_push", "create_pull_request"):
++            self.assertNotIn(git_tool, researcher.allowed_tools)
++
++    def test_system_prompt_contains_git_tool_docs(self):
++        import forge
++        content = forge._SYSTEM_MESSAGE["content"]
++        for tool_name in ("git_status", "git_diff", "git_commit",
++                          "create_pull_request"):
++            self.assertIn(tool_name, content,
++                          f"System prompt missing docs for {tool_name}")
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/test_modes.py b/test_modes.py
+index 57aaefd..ff68eed 100644
+--- a/test_modes.py
++++ b/test_modes.py
+@@ -14,9 +14,9 @@ import scheduler
+
+
+ class TestModeRegistry(unittest.TestCase):
+-    def test_all_six_modes_defined(self):
++    def test_all_seven_modes_defined(self):
+         expected = {"researcher", "planner", "coding_agent",
+-                    "mini_divs", "intern", "growth"}
++                    "mini_divs", "intern", "growth", "github_operator"}
+         self.assertEqual(set(modes.MODES.keys()), expected)
+
+     def test_every_mode_has_required_fields(self):
+@@ -43,9 +43,9 @@ class TestModeRegistry(unittest.TestCase):
+         for write_tool in ("write_file", "run_command", "apply_change_with_test"):
+             self.assertNotIn(write_tool, researcher_tools)
+
+-    def test_list_modes_returns_all_six(self):
++    def test_list_modes_returns_all_seven(self):
+         result = modes.list_modes()
+-        self.assertEqual(len(result), 6)
++        self.assertEqual(len(result), 7)
+         ids = {m["id"] for m in result}
+         self.assertEqual(ids, set(modes.MODES.keys()))
+
+@@ -200,7 +200,7 @@ class TestModeForgeTools(unittest.TestCase):
+         with patch.object(forge, "WORKSPACE", Path(self._ws.name)), \
+              patch.object(memory, "DB_PATH", self.db_path):
+             result = forge.list_modes_tool()
+-        self.assertEqual(len(result), 6)
++        self.assertEqual(len(result), 7)
+         self.assertTrue(all("id" in m for m in result))
+
+     def test_set_mode_tool_returns_mode_info(self):
+--
+2.43.0

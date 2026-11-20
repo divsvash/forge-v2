@@ -14,9 +14,9 @@ import scheduler
 
 
 class TestModeRegistry(unittest.TestCase):
-    def test_all_six_modes_defined(self):
+    def test_all_seven_modes_defined(self):
         expected = {"researcher", "planner", "coding_agent",
-                    "mini_divs", "intern", "growth"}
+                    "mini_divs", "intern", "growth", "github_operator"}
         self.assertEqual(set(modes.MODES.keys()), expected)
 
     def test_every_mode_has_required_fields(self):
@@ -43,9 +43,9 @@ class TestModeRegistry(unittest.TestCase):
         for write_tool in ("write_file", "run_command", "apply_change_with_test"):
             self.assertNotIn(write_tool, researcher_tools)
 
-    def test_list_modes_returns_all_six(self):
+    def test_list_modes_returns_all_seven(self):
         result = modes.list_modes()
-        self.assertEqual(len(result), 6)
+        self.assertEqual(len(result), 7)
         ids = {m["id"] for m in result}
         self.assertEqual(ids, set(modes.MODES.keys()))
 
@@ -200,7 +200,7 @@ class TestModeForgeTools(unittest.TestCase):
         with patch.object(forge, "WORKSPACE", Path(self._ws.name)), \
              patch.object(memory, "DB_PATH", self.db_path):
             result = forge.list_modes_tool()
-        self.assertEqual(len(result), 6)
+        self.assertEqual(len(result), 7)
         self.assertTrue(all("id" in m for m in result))
 
     def test_set_mode_tool_returns_mode_info(self):

@@ -232,6 +232,44 @@ results.
         default_max_steps=15,
         default_max_stalls=2,
     ),
+
+    "github_operator": Mode(
+        id="github_operator",
+        display_name="GitHub Operator",
+        description="Git/GitHub workflows — branch, commit, diff, push, open PRs.",
+        system_prompt_prefix="""\
+You are Forge in GITHUB OPERATOR mode.
+
+You manage Git repositories and GitHub workflows. Your job is to inspect
+state, make commits, open branches, push changes, and create pull requests
+— using the git_* and create_pull_request tools rather than raw shell
+commands.
+
+Workflow discipline:
+1. Always run git_status first to understand what's staged/unstaged.
+2. Use git_diff (staged=True) before committing — confirm the change is
+   exactly what was intended.
+3. Write clear, imperative commit messages (what this commit does, not
+   what you changed).
+4. Never force-push to main/master. Create a branch, push to it, then
+   open a PR.
+5. When opening a PR: title is a one-liner of the change; body lists
+   what changed and why, and links to relevant run_ids from recall_runs.
+
+If git operations fail (merge conflict, auth error, dirty tree) stop and
+report exactly what failed — do not guess or paper over it.
+""",
+        allowed_tools=frozenset({
+            "list_files", "read_file", "search_files",
+            "run_command",
+            "git_status", "git_diff", "git_log", "git_branch",
+            "git_checkout", "git_add", "git_commit", "git_push",
+            "git_clone", "create_pull_request",
+            "remember", "recall", "recall_runs",
+        }),
+        default_max_steps=20,
+        default_max_stalls=3,
+    ),
 }
 
 DEFAULT_MODE_ID = "coding_agent"

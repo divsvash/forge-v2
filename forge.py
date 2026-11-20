@@ -13,6 +13,7 @@ import memory
 import workflows as _workflows
 import scheduler as _scheduler
 import modes as _modes
+import github_tools as _gh
 from run_record import new_run, ToolCallRecord
 
 success_definition = None
@@ -21,6 +22,10 @@ evidence = []
 # ---------- WORKSPACE ----------
 
 WORKSPACE = Path(__file__).parent.parent / "workspace"
+
+# Point github_tools at the same workspace so git operations default to
+# the right directory. Tests override both via patch.object.
+_gh.REPO_PATH = WORKSPACE
 
 # ---------- SANDBOX BACKEND ----------
 # Selected once, lazily, and cached. Never assume Docker is available —
@@ -347,6 +352,64 @@ def set_mode_tool(mode_id):
 def list_modes_tool():
     """List all available Forge personalities with their descriptions."""
     return _modes.list_modes()
+
+
+# ---------- GITHUB / GIT TOOLS ----------
+
+def git_status_tool():
+    """Return the working-tree status of the repo (branch, staged, unstaged, untracked)."""
+    return _gh.git_status(repo_path=WORKSPACE)
+
+
+def git_diff_tool(staged=False, file_path=None):
+    """Return the diff. staged=True for staged changes only. file_path limits to one file."""
+    return _gh.git_diff(repo_path=WORKSPACE, staged=staged, file_path=file_path)
+
+
+def git_log_tool(n=10, branch=None):
+    """Return the last n commits as structured dicts (hash, author, date, subject)."""
+    return _gh.git_log(repo_path=WORKSPACE, n=n, branch=branch)
+
+
+def git_branch_tool():
+    """List branches and show the current one."""
+    return _gh.git_branch(repo_path=WORKSPACE)
+
+
+def git_checkout_tool(name, create=False):
+    """Check out a branch. create=True to create it (-b)."""
+    return _gh.git_checkout(name=name, create=create, repo_path=WORKSPACE)
+
+
+def git_add_tool(paths=None):
+    """Stage files. paths=None stages everything. Pass a list to stage specific files."""
+    return _gh.git_add(paths=paths, repo_path=WORKSPACE)
+
+
+def git_commit_tool(message):
+    """Commit staged changes with the given message. Returns early if nothing is staged."""
+    return _gh.git_commit(message=message, repo_path=WORKSPACE)
+
+
+def git_push_tool(remote="origin", branch=None, force=False):
+    """Push to remote. force=True uses --force-with-lease (never force-push to main)."""
+    return _gh.git_push(remote=remote, branch=branch, force=force, repo_path=WORKSPACE)
+
+
+def git_clone_tool(url, dest=None):
+    """Clone a repository. dest is a directory name relative to WORKSPACE's parent."""
+    return _gh.git_clone(url=url, dest=dest, repo_path=WORKSPACE)
+
+
+def create_pull_request_tool(title, body="", base="main", head=None, draft=False):
+    """
+    Create a GitHub PR via the gh CLI. Falls back to a URL template if gh
+    is not available. Requires GITHUB_TOKEN in the environment or gh auth login.
+    """
+    return _gh.create_pull_request(
+        title=title, body=body, base=base, head=head, draft=draft,
+        repo_path=WORKSPACE,
+    )
 
 
 def search_files(query):
@@ -684,6 +747,132 @@ TOOLS = {
         func=list_modes_tool,
         schema={"type": "object", "properties": {}},
         risk="read",
+        sandboxed=False,
+    ),
+
+    # ---------- GITHUB / GIT TOOLS ----------
+    "git_status": ToolSpec(
+        name="git_status",
+        func=git_status_tool,
+        schema={"type": "object", "properties": {}},
+        risk="read",
+        sandboxed=False,
+    ),
+    "git_diff": ToolSpec(
+        name="git_diff",
+        func=git_diff_tool,
+        schema={
+            "type": "object",
+            "properties": {
+                "staged": {"type": "boolean"},
+                "file_path": {"type": "string"},
+            },
+        },
+        risk="read",
+        sandboxed=False,
+    ),
+    "git_log": ToolSpec(
+        name="git_log",
+        func=git_log_tool,
+        schema={
+            "type": "object",
+            "properties": {
+                "n": {"type": "integer"},
+                "branch": {"type": "string"},
+            },
+        },
+        risk="read",
+        sandboxed=False,
+    ),
+    "git_branch": ToolSpec(
+        name="git_branch",
+        func=git_branch_tool,
+        schema={"type": "object", "properties": {}},
+        risk="read",
+        sandboxed=False,
+    ),
+    "git_checkout": ToolSpec(
+        name="git_checkout",
+        func=git_checkout_tool,
+        schema={
+            "type": "object",
+            "properties": {
+                "name": {"type": "string"},
+                "create": {"type": "boolean"},
+            },
+            "required": ["name"],
+        },
+        risk="write",
+        sandboxed=False,
+    ),
+    "git_add": ToolSpec(
+        name="git_add",
+        func=git_add_tool,
+        schema={
+            "type": "object",
+            "properties": {
+                "paths": {"type": "array", "items": {"type": "string"}},
+            },
+        },
+        risk="write",
+        sandboxed=False,
+    ),
+    "git_commit": ToolSpec(
+        name="git_commit",
+        func=git_commit_tool,
+        schema={
+            "type": "object",
+            "properties": {
+                "message": {"type": "string"},
+            },
+            "required": ["message"],
+        },
+        risk="write",
+        sandboxed=False,
+    ),
+    "git_push": ToolSpec(
+        name="git_push",
+        func=git_push_tool,
+        schema={
+            "type": "object",
+            "properties": {
+                "remote": {"type": "string"},
+                "branch": {"type": "string"},
+                "force": {"type": "boolean"},
+            },
+        },
+        risk="exec",
+        sandboxed=False,
+    ),
+    "git_clone": ToolSpec(
+        name="git_clone",
+        func=git_clone_tool,
+        schema={
+            "type": "object",
+            "properties": {
+                "url": {"type": "string"},
+                "dest": {"type": "string"},
+            },
+            "required": ["url"],
+        },
+        risk="exec",
+        sandboxed=False,
+    ),
+    "create_pull_request": ToolSpec(
+        name="create_pull_request",
+        func=create_pull_request_tool,
+        schema={
+            "type": "object",
+            "properties": {
+                "title": {"type": "string"},
+                "body": {"type": "string"},
+                "base": {"type": "string"},
+                "head": {"type": "string"},
+                "draft": {"type": "boolean"},
+            },
+            "required": ["title"],
+        },
+        risk="exec",
         sandboxed=False,
     ),
 }
@@ -1123,11 +1312,104 @@ mini_divs, intern, growth) with their descriptions and tool access.
 set_mode:
 Switch the active personality for this project. Persists across runs.
 Valid mode_id values: researcher, planner, coding_agent, mini_divs,
-intern, growth.
+intern, growth, github_operator.
 
 {
   "tool": "set_mode",
   "arguments": {"mode_id": "researcher"}
+}
+
+git_status:
+Show the working-tree status: current branch, staged/unstaged/untracked files.
+Always call this before committing or pushing.
+
+{
+  "tool": "git_status",
+  "arguments": {}
+}
+
+git_diff:
+Show changes not yet staged (staged=false, the default) or changes staged for
+commit (staged=true). Pass file_path to limit to one file.
+
+{
+  "tool": "git_diff",
+  "arguments": {"staged": true}
+}
+
+git_log:
+Show the last n commits (default 10) as structured dicts. Pass branch to
+inspect another branch.
+
+{
+  "tool": "git_log",
+  "arguments": {"n": 5}
+}
+
+git_branch:
+List all local branches and show which one is current.
+
+{
+  "tool": "git_branch",
+  "arguments": {}
+}
+
+git_checkout:
+Check out a branch. Pass create=true to create it (-b). Never force-push to
+main/master — create a feature branch instead.
+
+{
+  "tool": "git_checkout",
+  "arguments": {"name": "feature/my-change", "create": true}
+}
+
+git_add:
+Stage files for commit. paths=null stages everything. Pass a list to stage
+specific files.
+
+{
+  "tool": "git_add",
+  "arguments": {"paths": ["src/foo.py", "tests/test_foo.py"]}
+}
+
+git_commit:
+Commit staged changes with a message. Returns committed=false (with a reason)
+if nothing is staged — use git_add first.
+
+{
+  "tool": "git_commit",
+  "arguments": {"message": "feat: add retry backoff to scheduler"}
+}
+
+git_push:
+Push to remote. force=true uses --force-with-lease (safer than --force).
+Never force-push to main/master.
+
+{
+  "tool": "git_push",
+  "arguments": {"remote": "origin", "branch": "feature/my-change"}
+}
+
+git_clone:
+Clone a repository. dest is a directory name relative to the workspace parent.
+
+{
+  "tool": "git_clone",
+  "arguments": {"url": "https://github.com/owner/repo.git", "dest": "repo"}
+}
+
+create_pull_request:
+Create a GitHub PR via the gh CLI. Falls back to a URL template if gh is not
+available. base defaults to "main". head defaults to the current branch.
+
+{
+  "tool": "create_pull_request",
+  "arguments": {
+    "title": "feat: add GitHub operator mode",
+    "body": "Adds git_* tools and github_operator personality to Forge.",
+    "base": "main",
+    "draft": false
+  }
 }
 
 Do not invent files.
